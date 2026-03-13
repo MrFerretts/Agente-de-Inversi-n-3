@@ -34,6 +34,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional
 from pathlib import Path
+from database import Database
 
 import pandas as pd
 import numpy as np
