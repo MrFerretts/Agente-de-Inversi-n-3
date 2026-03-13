@@ -29,12 +29,13 @@ import sqlite3
 import smtplib
 import threading
 import traceback
+
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional
 from pathlib import Path
-from database import Database
+
 
 import pandas as pd
 import numpy as np
@@ -44,6 +45,8 @@ import schedule
 # ── Ajuste de path para importar tus módulos existentes ──────────────────────
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
+
+import database as db_supabase
 
 from market_data import MarketDataFetcher
 from technical_analysis import TechnicalAnalyzer
@@ -109,220 +112,44 @@ logger = logging.getLogger("PatoQuant")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BASE DE DATOS — SQLite
+# BASE DE DATOS — Adaptador a Supabase (PostgreSQL)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Database:
     """
-    Gestiona toda la persistencia del scheduler.
-    Tablas:
-      - scan_results   : resultado de cada escaneo por ticker
-      - alerts_sent    : historial de alertas enviadas
-      - watchlist      : tickers a monitorear (sincronizado con watchlist.json)
-      - ml_signals     : predicciones ML por ticker
+    Adaptador que conecta la lógica antigua del scheduler 
+    con las nuevas funciones de Supabase en database.py.
     """
-
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self):
-        """Crea las tablas si no existen."""
-        with self._connect() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS scan_results (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker      TEXT NOT NULL,
-                    timestamp   TEXT NOT NULL,
-                    price       REAL,
-                    change_pct  REAL,
-                    score       INTEGER,
-                    recommendation TEXT,
-                    rsi         REAL,
-                    adx         REAL,
-                    macd_hist   REAL,
-                    rvol        REAL,
-                    atr         REAL,
-                    regime      TEXT,
-                    raw_json    TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS alerts_sent (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker      TEXT NOT NULL,
-                    timestamp   TEXT NOT NULL,
-                    alert_type  TEXT,
-                    message     TEXT,
-                    channel     TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS watchlist (
-                    ticker      TEXT PRIMARY KEY,
-                    category    TEXT DEFAULT 'stock',
-                    added_at    TEXT DEFAULT (datetime('now')),
-                    active      INTEGER DEFAULT 1
-                );
-
-                CREATE TABLE IF NOT EXISTS ml_signals (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker          TEXT NOT NULL,
-                    timestamp       TEXT NOT NULL,
-                    prob_up         REAL,
-                    prob_down       REAL,
-                    recommendation  TEXT,
-                    confidence      REAL,
-                    model_accuracy  REAL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_scan_ticker_ts
-                    ON scan_results(ticker, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_alerts_ticker
-                    ON alerts_sent(ticker, timestamp);
-            """)
-        logger.info(f"✅ Base de datos lista: {self.db_path}")
-
-    # ── Scan results ──────────────────────────────────────────────────────────
+    def __init__(self, db_path=None):
+        logger.info("Conectando a Supabase PostgreSQL...")
+        db_supabase.init_tables()
 
     def save_scan_result(self, ticker: str, result: Dict):
-        """Guarda el resultado de un escaneo."""
-        ts = datetime.now(pytz.timezone(CONFIG["timezone"])).isoformat()
-        with self._connect() as conn:
-            conn.execute("""
-                INSERT INTO scan_results
-                    (ticker, timestamp, price, change_pct, score, recommendation,
-                     rsi, adx, macd_hist, rvol, atr, regime, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticker, ts,
-                result.get("price"),
-                result.get("change_pct"),
-                result.get("score"),
-                result.get("recommendation"),
-                result.get("rsi"),
-                result.get("adx"),
-                result.get("macd_hist"),
-                result.get("rvol"),
-                result.get("atr"),
-                result.get("regime"),
-                json.dumps(result),
-            ))
-
-    def get_latest_results(self, limit: int = 50) -> pd.DataFrame:
-        """Retorna los últimos N resultados ordenados por score."""
-        with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT ticker, timestamp, price, change_pct, score,
-                       recommendation, rsi, adx, rvol, regime
-                FROM scan_results
-                WHERE timestamp >= datetime('now', '-1 hour')
-                ORDER BY ABS(score) DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-        return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-
-    def get_ticker_history(self, ticker: str, days: int = 7) -> pd.DataFrame:
-        """Historial de un ticker específico."""
-        with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT timestamp, price, score, rsi, adx, rvol
-                FROM scan_results
-                WHERE ticker = ?
-                  AND timestamp >= datetime('now', ?)
-                ORDER BY timestamp ASC
-            """, (ticker, f"-{days} days")).fetchall()
-        return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-
-    def cleanup_old_data(self, days: int):
-        """Borra registros antiguos para mantener la BD liviana."""
-        with self._connect() as conn:
-            deleted = conn.execute("""
-                DELETE FROM scan_results
-                WHERE timestamp < datetime('now', ?)
-            """, (f"-{days} days",)).rowcount
-        if deleted:
-            logger.info(f"🗑️  Limpieza: {deleted} registros eliminados (>{days} días)")
-
-    # ── Watchlist ─────────────────────────────────────────────────────────────
+        db_supabase.save_scan_result(ticker, result)
 
     def get_watchlist(self) -> List[Dict]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT ticker, category FROM watchlist WHERE active=1"
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return db_supabase.get_watchlist()
 
     def sync_watchlist_from_json(self, json_path: str = "data/watchlist.json"):
-        """
-        Sincroniza la BD con tu watchlist.json existente.
-        Llámalo al arrancar el scheduler.
-        """
-        if not os.path.exists(json_path):
-            logger.warning(f"⚠️  {json_path} no encontrado. Usa la watchlist por defecto.")
-            return
-
-        with open(json_path, "r") as f:
-            data = json.load(f)
-
-        stocks = data.get("stocks", [])
-        crypto = data.get("crypto", [])
-
-        with self._connect() as conn:
-            for ticker in stocks:
-                conn.execute("""
-                    INSERT OR IGNORE INTO watchlist (ticker, category) VALUES (?, 'stock')
-                """, (ticker,))
-            for ticker in crypto:
-                conn.execute("""
-                    INSERT OR IGNORE INTO watchlist (ticker, category) VALUES (?, 'crypto')
-                """, (ticker,))
-
-        total = len(stocks) + len(crypto)
-        logger.info(f"📋 Watchlist sincronizada: {total} activos")
-
-    # ── Alertas ───────────────────────────────────────────────────────────────
+        db_supabase.sync_watchlist_from_json(json_path)
 
     def save_alert(self, ticker: str, alert_type: str, message: str, channel: str):
-        ts = datetime.now(pytz.timezone(CONFIG["timezone"])).isoformat()
-        with self._connect() as conn:
-            conn.execute("""
-                INSERT INTO alerts_sent (ticker, timestamp, alert_type, message, channel)
-                VALUES (?, ?, ?, ?, ?)
-            """, (ticker, ts, alert_type, message, channel))
+        db_supabase.save_alert(ticker, alert_type, message, channel)
 
-    def was_alert_sent_recently(self, ticker: str, alert_type: str,
-                                 cooldown_minutes: int = 30) -> bool:
-        """Evita spam: retorna True si ya se envió esta alerta recientemente."""
-        since = (datetime.now() - timedelta(minutes=cooldown_minutes)).isoformat()
-        with self._connect() as conn:
-            count = conn.execute("""
-                SELECT COUNT(*) FROM alerts_sent
-                WHERE ticker=? AND alert_type=? AND timestamp > ?
-            """, (ticker, alert_type, since)).fetchone()[0]
-        return count > 0
+    def was_alert_sent_recently(self, ticker: str, alert_type: str, cooldown_minutes: int = 30) -> bool:
+        return not db_supabase.alert_cooldown_ok(ticker, alert_type, cooldown_minutes)
 
-    # ── ML Signals ────────────────────────────────────────────────────────────
+    def cleanup_old_data(self, days: int):
+        db_supabase.cleanup_old_data(days)
 
+    def get_latest_results(self, limit: int = 50) -> pd.DataFrame:
+        return db_supabase.get_top_picks(n=limit)
+
+    def get_ticker_history(self, ticker: str, days: int = 7) -> pd.DataFrame:
+        return db_supabase.get_ticker_history(ticker, days)
+        
     def save_ml_signal(self, ticker: str, prediction: Dict):
-        ts = datetime.now(pytz.timezone(CONFIG["timezone"])).isoformat()
-        with self._connect() as conn:
-            conn.execute("""
-                INSERT INTO ml_signals
-                    (ticker, timestamp, prob_up, prob_down, recommendation,
-                     confidence, model_accuracy)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticker, ts,
-                prediction.get("probability_up"),
-                prediction.get("probability_down"),
-                prediction.get("recommendation"),
-                prediction.get("confidence"),
-                prediction.get("model_accuracy"),
-            ))
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
