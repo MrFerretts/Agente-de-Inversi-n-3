@@ -1,0 +1,14 @@
+# ============================================================
+# PATO QUANT — DASHBOARD
+# Requirements solo para dashboard.py
+# Sin tensorflow, sin dependencias innecesarias
+# Compatible con Python 3.11+ en Streamlit Cloud
+# ============================================================
+
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.17.0
+pytz>=2023.3
+requests>=2.31.0
+python-dateutil>=2.8.2
