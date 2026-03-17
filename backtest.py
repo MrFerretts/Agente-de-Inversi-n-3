@@ -86,6 +86,9 @@ def download_data(tickers: List[str], years: int = 5) -> Dict[str, pd.DataFrame]
             df = yf.download(ticker, start=start, end=end,
                              auto_adjust=True, progress=False)
             if df is not None and len(df) >= BT_CONFIG["warmup_days"] + 30:
+                # Fix yfinance MultiIndex columns (v1.2+)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
                 df["Returns"] = df["Close"].pct_change()
                 data[ticker]  = df
                 logger.info(f"  ✅ {ticker}: {len(df)} días")
