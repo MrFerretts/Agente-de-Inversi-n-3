@@ -1,5 +1,5 @@
 """
-CONSENSUS SCORING SYSTEM — v2.0 (Pesos Dinámicos)
+CONSENSUS SCORING SYSTEM — v2.1 (Pesos Dinámicos, Groq reducido)
 Combina todos los análisis (Técnico, ML, LSTM, Groq) en una recomendación
 única ponderada. Los pesos se ajustan automáticamente según:
 
@@ -7,6 +7,10 @@ Combina todos los análisis (Técnico, ML, LSTM, Groq) en una recomendación
   2. Calidad del ML    (accuracy real post-leakage-fix → escala su peso)
   3. Acuerdo entre fuentes (alta divergencia → reduce confianza y ajusta pesos)
   4. Disponibilidad   (si LSTM no está entrenado, su peso se redistribuye)
+
+FIX v2.1: Groq/LLM reducido a 5-10% máximo. Los LLMs no tienen capacidad
+predictiva sobre precios. Se usan solo como filtro de contexto macro, no
+como señal de trading.
 """
 
 import numpy as np
@@ -24,28 +28,28 @@ from typing import Dict, Optional, List
 
 REGIME_WEIGHTS = {
     'RISK_ON': {
-        'technical': 25,
-        'ml':        30,   # ML más fiable en mercados tranquilos
+        'technical': 30,
+        'ml':        32,   # ML más fiable en mercados tranquilos
         'lstm':      30,   # LSTM idem
-        'groq':      15,
+        'groq':       8,   # LLM solo como filtro de contexto, sin poder predictivo
     },
     'NEUTRAL': {
-        'technical': 30,
-        'ml':        25,
-        'lstm':      25,
-        'groq':      20,
+        'technical': 35,
+        'ml':        28,
+        'lstm':      27,
+        'groq':      10,   # Máximo 10% — solo contexto macro
     },
     'RISK_OFF': {
-        'technical': 40,   # Indicadores técnicos más confiables en alta vol
-        'ml':        15,   # ML entrenado en datos "normales" pierde precisión
-        'lstm':      15,
-        'groq':      30,   # Groq puede contextualizar eventos macro
+        'technical': 45,   # Indicadores técnicos más confiables en alta vol
+        'ml':        22,   # ML entrenado en datos "normales" pierde precisión
+        'lstm':      25,
+        'groq':       8,   # LLM no predice crisis mejor que VIX
     },
     'CRISIS': {
-        'technical': 50,
-        'ml':        10,
-        'lstm':      10,
-        'groq':      30,
+        'technical': 55,
+        'ml':        15,
+        'lstm':      25,
+        'groq':       5,   # En crisis, LLM es ruido — mínimo peso
     },
 }
 

@@ -61,7 +61,67 @@ RISK_CONFIG = {
     # ── Cooldown ─────────────────────────────────────────────────────────────
     "trade_cooldown_hours": 4,      # Esperar 4h antes de re-entrar en mismo ticker
     "max_trades_per_day":  10,      # Máximo 10 operaciones por día
+
+    # ── Correlación sectorial ────────────────────────────────────────────────
+    "max_positions_per_sector": 3,  # Máximo 3 posiciones en el mismo sector
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAPA DE SECTORES — Evita concentración en activos correlacionados
+# ─────────────────────────────────────────────────────────────────────────────
+
+SECTOR_MAP = {
+    # Tech
+    "AAPL": "tech", "MSFT": "tech", "GOOGL": "tech", "GOOG": "tech",
+    "META": "tech", "NVDA": "tech", "AMD": "tech", "INTC": "tech",
+    "CRM": "tech", "ORCL": "tech", "ADBE": "tech", "CSCO": "tech",
+    "AVGO": "tech", "QCOM": "tech", "MU": "tech", "AMAT": "tech",
+    "PLTR": "tech", "SNOW": "tech", "NET": "tech", "DDOG": "tech",
+    # E-commerce / Internet
+    "AMZN": "ecommerce", "SHOP": "ecommerce", "MELI": "ecommerce",
+    "BABA": "ecommerce", "JD": "ecommerce", "EBAY": "ecommerce",
+    # Fintech / Finanzas
+    "V": "fintech", "MA": "fintech", "PYPL": "fintech", "SQ": "fintech",
+    "COIN": "fintech", "JPM": "fintech", "GS": "fintech", "BAC": "fintech",
+    "WFC": "fintech", "C": "fintech", "SOFI": "fintech",
+    # Auto / EV
+    "TSLA": "auto", "F": "auto", "GM": "auto", "RIVN": "auto",
+    "LCID": "auto", "NIO": "auto",
+    # Media / Entertainment
+    "DIS": "media", "NFLX": "media", "CMCSA": "media", "WBD": "media",
+    "SPOT": "media", "ROKU": "media",
+    # Healthcare
+    "JNJ": "health", "UNH": "health", "PFE": "health", "ABBV": "health",
+    "MRK": "health", "LLY": "health", "TMO": "health",
+    # Energy
+    "XOM": "energy", "CVX": "energy", "COP": "energy", "OXY": "energy",
+    "USO": "energy", "XLE": "energy",
+    # Crypto
+    "BTC-USD": "crypto", "ETH-USD": "crypto", "SOL-USD": "crypto",
+    "XRP-USD": "crypto", "ADA-USD": "crypto", "DOGE-USD": "crypto",
+    "AVAX-USD": "crypto", "DOT-USD": "crypto", "MATIC-USD": "crypto",
+    "MSTR": "crypto",
+    # Commodities
+    "GC=F": "commodity", "SI=F": "commodity", "CL=F": "commodity",
+    "GLD": "commodity", "SLV": "commodity",
+    # Aerospace / Defense
+    "RKLB": "aerospace", "BA": "aerospace", "LMT": "aerospace",
+    "RTX": "aerospace", "NOC": "aerospace",
+    # ETFs sectoriales
+    "SPY": "index_etf", "QQQ": "index_etf", "IWM": "index_etf",
+    "DIA": "index_etf", "VOO": "index_etf",
+    "XLF": "sector_etf", "XLV": "sector_etf", "XLU": "sector_etf",
+    "XLK": "sector_etf", "XLE": "sector_etf", "XLI": "sector_etf",
+    # Cybersecurity
+    "OKTA": "cybersec", "CRWD": "cybersec", "ZS": "cybersec",
+    "PANW": "cybersec", "FTNT": "cybersec",
+}
+
+
+def get_sector(ticker: str) -> str:
+    """Retorna el sector del ticker. Default: 'other'."""
+    return SECTOR_MAP.get(ticker, "other")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,6 +360,20 @@ class TradingBrain:
         if not ok:
             return False, reason
 
+        # ── 5b. Límite de posiciones por sector (anti-correlación) ───────────
+
+        sector = get_sector(ticker)
+        positions = self.alpaca.get_positions()
+        sector_count = sum(
+            1 for p in positions
+            if get_sector(p.get("symbol", "")) == sector
+        )
+        max_per_sector = RISK_CONFIG["max_positions_per_sector"]
+        if sector_count >= max_per_sector:
+            return False, (
+                f"Sector '{sector}' saturado ({sector_count}/{max_per_sector} posiciones)"
+            )
+
         # ── 6. Filtro ML (bonus de confianza si disponible) ───────────────────
 
         ml_confidence = 0.0
@@ -487,9 +561,10 @@ class AutonomousTrader:
       3. Log de todo en Supabase
     """
 
-    def __init__(self, db, notifier):
-        self.db       = db
-        self.notifier = notifier
+    def __init__(self, db, notifier, perf_tracker=None):
+        self.db            = db
+        self.notifier      = notifier
+        self.perf_tracker  = perf_tracker
 
         try:
             self.alpaca = AlpacaClient()
@@ -567,6 +642,16 @@ class AutonomousTrader:
                     self.brain.log_trade(ticker, "SELL", qty, price, reason)
                     self._notify_trade(ticker, "VENTA", qty, price, pnl_pct, reason)
                     self._save_trade_db(ticker, "SELL", qty, price, pnl_pct, reason)
+
+                    # Registrar en performance tracker
+                    if self.perf_tracker:
+                        entry = float(position.get("avg_entry_price", 0))
+                        pnl_usd = (price - entry) * qty
+                        self.perf_tracker.record_trade(
+                            ticker=ticker, action="SELL", qty=qty,
+                            entry_price=entry, exit_price=price,
+                            pnl=pnl_usd, reason=reason,
+                        )
             else:
                 logger.info(f"   🟡 MANTENER {ticker}: {reason}")
 

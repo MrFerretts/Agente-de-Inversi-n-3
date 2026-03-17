@@ -33,14 +33,15 @@ from technical_analysis import TechnicalAnalyzer
 from core.state_manager import DataProcessor
 from proactive_agent import ProactiveAgent
 from autonomous_trader import AutonomousTrader          # ← CAMBIO 1
+from core.performance_tracker import PerformanceTracker
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIG = {
-    "scan_interval_minutes": 5,
-    "ml_retrain_hours":      24,
+    "scan_interval_minutes": 30,    # FIX: Con datos diarios, escanear cada 30 min es suficiente
+    "ml_retrain_hours":      24,    # (antes: 5 min — generaba ruido innecesario con velas diarias)
     "market_hours_only":     True,
     "agent_interval_hours":  4,
     "alert_score_threshold": 60,
@@ -277,10 +278,14 @@ class QuantScheduler:
         )
         logger.info("🤖 Agente Proactivo listo")
 
+        # ── Performance Tracker: métricas reales (no backtest) ────────────────
+        self.perf_tracker = PerformanceTracker()
+
         # ── CAMBIO 2: Inicializar trader autónomo ─────────────────────────────
         self.trader = AutonomousTrader(
             db=self.db,
             notifier=self.notifier,
+            perf_tracker=self.perf_tracker,
         )
 
     def _load_app_config(self):
@@ -374,6 +379,18 @@ class QuantScheduler:
                     scan_results=results,
                     ml_models=self.ml_models,
                 )
+
+                # Registrar equity para performance tracking
+                try:
+                    trader_status = self.trader.get_status()
+                    if trader_status.get("active"):
+                        self.perf_tracker.record_equity(
+                            equity=trader_status.get("equity", 0),
+                            cash=trader_status.get("cash", 0),
+                            n_positions=trader_status.get("open_positions", 0),
+                        )
+                except Exception as e:
+                    logger.debug(f"Performance tracking: {e}")
 
         self.stats["scans_completed"] += 1
         logger.info(
@@ -541,6 +558,9 @@ class QuantScheduler:
             f"{'═'*50}"
         )
 
+        # Reporte de performance real
+        logger.info(self.perf_tracker.format_report())
+
     # ── SETUP Y RUN ───────────────────────────────────────────────────────────
 
     def setup_schedule(self):
@@ -553,6 +573,7 @@ class QuantScheduler:
         schedule.every(agent_hours).hours.do(self.run_agent)
         schedule.every().day.at("09:25").do(self.run_agent)
         schedule.every(1).hours.do(self.print_status)
+        schedule.every().day.at("16:05").do(self._send_daily_performance)
         schedule.every().day.at("02:00").do(
             lambda: self.db.cleanup_old_data(CONFIG["results_retention_days"])
         )
@@ -561,7 +582,31 @@ class QuantScheduler:
         logger.info(f"   → Scan + Trading: cada {interval} minutos")
         logger.info(f"   → ML retrain: cada {retrain_hours} horas")
         logger.info(f"   → Agente proactivo: cada {agent_hours} horas + 09:25 ET")
+        logger.info(f"   → Performance report: diario a las 16:05 ET")
         logger.info(f"   → Limpieza BD: diaria a las 02:00")
+
+    def _send_daily_performance(self):
+        """Envía reporte diario de performance por Telegram al cierre."""
+        try:
+            metrics = self.perf_tracker.get_metrics()
+            if metrics.get("status") == "insufficient_data":
+                return
+
+            msg = (
+                f"📊 *PERFORMANCE DIARIA — Paper Trading*\n\n"
+                f"💰 Equity: ${metrics['current_equity']:,.2f}\n"
+                f"📈 Retorno total: {metrics['total_return_pct']:+.2f}%\n"
+                f"📉 Drawdown actual: {metrics['current_drawdown_pct']:.2f}%\n"
+                f"📐 Sharpe: {metrics['sharpe_ratio']:.3f} "
+                f"(30d: {metrics['sharpe_30d']:.3f})\n"
+                f"🎯 Win rate: {metrics['win_rate_pct']:.1f}%\n"
+                f"💹 Profit factor: {metrics['profit_factor']:.2f}\n"
+                f"📋 Trades cerrados: {metrics['total_trades']}\n"
+                f"📅 Días trackeados: {metrics['days_tracked']}"
+            )
+            self.notifier.send_telegram(msg, "PERF", "daily_performance")
+        except Exception as e:
+            logger.error(f"❌ Error enviando performance: {e}")
 
     def run(self):
         logger.info("\n" + "═"*50)
