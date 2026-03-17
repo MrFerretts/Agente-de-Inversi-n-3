@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+data/trader_state.json
+data/performance_history.json
