@@ -52,18 +52,22 @@ DEFAULT_TICKERS = [
 
 BT_CONFIG = {
     "initial_capital":    10_000.0,
-    "position_pct":       0.10,       # 10% del capital por trade
+    "position_pct":       0.30,       # 30% del capital por trade (backtest single-ticker)
+    "max_position_pct":   0.35,       # Máximo 35% en un solo activo
+    "max_positions":      4,          # Hasta 4 posiciones simultáneas
     "commission_pct":     0.001,      # 0.1% comisión por lado
     "slippage_pct":       0.0005,     # 0.05% slippage por ejecución
-    "stop_loss_atr_mult": 2.0,
-    "take_profit_atr_mult": 4.0,
+    "stop_loss_atr_mult": 1.5,        # Stop loss más ajustado (1.5x ATR)
+    "take_profit_atr_mult": 3.0,      # Take profit (3x ATR) → R:R 1:2
+    "trailing_stop":      True,       # Trailing stop activo
+    "trailing_atr_mult":  1.2,        # Trailing = high_water - (ATR * 1.2)
 
     # Filtros de entrada técnica
-    "min_score_tech":     40,         # Score mínimo para señal de compra
-    "min_score_sell":    -30,         # Score máximo para señal de venta
+    "min_score_tech":     30,         # Score mínimo para señal de compra (antes 40)
+    "min_score_sell":    -25,         # Score máximo para señal de venta
 
     # Filtros ML
-    "min_ml_prob":        0.60,       # Probabilidad mínima de subida
+    "min_ml_prob":        0.55,       # Probabilidad mínima (antes 0.60)
 
     # Warm-up: días necesarios para calcular todos los indicadores
     "warmup_days":        60,
@@ -127,8 +131,7 @@ class BacktestEngine:
                        df_full: pd.DataFrame) -> pd.DataFrame:
         """
         Backtesting de la estrategia de scoring técnico.
-        Señal de compra: score >= min_score_tech
-        Señal de venta:  score <= min_score_sell  O  stop/TP activado
+        Soporta múltiples entradas al mismo ticker (scaling in) y trailing stop.
         """
         # Calcular indicadores completos
         df = DataProcessor.prepare_full_analysis(df_full, self.analyzer)
@@ -149,12 +152,9 @@ class BacktestEngine:
 
         df["score"] = scores
 
-        # Simular trades
+        # Simular trades con múltiples posiciones
         capital    = self.initial_capital
-        position   = 0.0     # shares held
-        entry_price = 0.0
-        stop_loss  = 0.0
-        take_profit = 0.0
+        positions  = []   # Lista de posiciones abiertas: {qty, entry, stop, tp, high_water, date}
         trades     = []
         equity     = []
 
@@ -163,81 +163,97 @@ class BacktestEngine:
             score = float(row["score"])
             atr   = float(row.get("ATR", price * 0.02))
 
-            current_value = capital + position * price
+            # Valor total = cash + valor de todas las posiciones abiertas
+            positions_value = sum(p["qty"] * price for p in positions)
+            current_value = capital + positions_value
             equity.append({"date": idx, "equity": current_value,
                            "price": price, "score": score})
 
-            # Gestión de posición abierta
-            if position > 0:
-                # Stop loss
-                if price <= stop_loss:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "stop_loss",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                    })
-                    position = 0.0
+            # ── Gestionar posiciones abiertas (trailing stop, SL, TP) ──────
+            closed = []
+            for j, pos in enumerate(positions):
+                # Actualizar high water mark para trailing stop
+                pos["high_water"] = max(pos["high_water"], price)
+
+                sell_reason = None
+
+                # Stop loss fijo
+                if price <= pos["stop"]:
+                    sell_reason = "stop_loss"
+
+                # Trailing stop (solo si estamos en ganancia)
+                elif BT_CONFIG["trailing_stop"] and price > pos["entry"]:
+                    trailing_stop = pos["high_water"] - atr * BT_CONFIG["trailing_atr_mult"]
+                    if trailing_stop > pos["stop"] and price <= trailing_stop:
+                        sell_reason = "trailing_stop"
 
                 # Take profit
-                elif price >= take_profit:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "take_profit",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                    })
-                    position = 0.0
+                elif price >= pos["tp"]:
+                    sell_reason = "take_profit"
 
                 # Señal bajista fuerte
                 elif score <= BT_CONFIG["min_score_sell"]:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "signal_sell",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                    })
-                    position = 0.0
+                    sell_reason = "signal_sell"
 
-            # Nueva entrada
-            elif position == 0 and score >= BT_CONFIG["min_score_tech"]:
+                if sell_reason:
+                    sell_price = self._apply_transaction_cost(price, "sell")
+                    pnl = (sell_price - pos["entry"]) * pos["qty"]
+                    capital += pos["qty"] * sell_price
+                    trades.append({
+                        "ticker": ticker, "entry_date": pos["date"],
+                        "exit_date": idx, "entry": pos["entry"],
+                        "exit": sell_price, "qty": pos["qty"],
+                        "pnl": pnl, "reason": sell_reason,
+                        "pnl_pct": (sell_price / pos["entry"] - 1) * 100,
+                    })
+                    closed.append(j)
+
+            # Eliminar posiciones cerradas (en orden inverso para no romper índices)
+            for j in sorted(closed, reverse=True):
+                positions.pop(j)
+
+            # ── Nueva entrada (si hay espacio y señal) ────────────────────
+            # Filtro de tendencia: NO comprar si precio < SMA50 (tendencia bajista)
+            sma50 = row.get("SMA50", None)
+            trend_ok = True
+            if pd.notna(sma50) and price < sma50 * 0.98:
+                trend_ok = False  # 2% debajo de SMA50 = tendencia bajista
+
+            if (trend_ok
+                    and len(positions) < BT_CONFIG["max_positions"]
+                    and score >= BT_CONFIG["min_score_tech"]):
                 buy_price = self._apply_transaction_cost(price, "buy")
-                trade_capital = capital * BT_CONFIG["position_pct"]
+                trade_capital = current_value * BT_CONFIG["position_pct"]
+                # No exceder max_position_pct
+                max_trade = current_value * BT_CONFIG["max_position_pct"]
+                trade_capital = min(trade_capital, max_trade)
                 qty = trade_capital / buy_price
 
                 if qty * buy_price <= capital:
-                    position    = qty
-                    capital    -= qty * buy_price
-                    entry_price = buy_price
-                    entry_date  = idx
-                    stop_loss   = buy_price - atr * BT_CONFIG["stop_loss_atr_mult"]
-                    take_profit = buy_price + atr * BT_CONFIG["take_profit_atr_mult"]
+                    capital -= qty * buy_price
+                    positions.append({
+                        "qty": qty,
+                        "entry": buy_price,
+                        "date": idx,
+                        "stop": buy_price - atr * BT_CONFIG["stop_loss_atr_mult"],
+                        "tp": buy_price + atr * BT_CONFIG["take_profit_atr_mult"],
+                        "high_water": buy_price,
+                    })
 
-        # Cerrar posición al final si queda abierta
-        if position > 0:
+        # Cerrar posiciones abiertas al final
+        if positions:
             last_price = float(df["Close"].iloc[-1])
-            sell_price = self._apply_transaction_cost(last_price, "sell")
-            pnl = (sell_price - entry_price) * position
-            capital += position * sell_price
-            trades.append({
-                "ticker": ticker, "entry_date": entry_date,
-                "exit_date": df.index[-1], "entry": entry_price,
-                "exit": sell_price, "qty": position,
-                "pnl": pnl, "reason": "end_of_period",
-                "pnl_pct": (sell_price / entry_price - 1) * 100,
-            })
+            for pos in positions:
+                sell_price = self._apply_transaction_cost(last_price, "sell")
+                pnl = (sell_price - pos["entry"]) * pos["qty"]
+                capital += pos["qty"] * sell_price
+                trades.append({
+                    "ticker": ticker, "entry_date": pos["date"],
+                    "exit_date": df.index[-1], "entry": pos["entry"],
+                    "exit": sell_price, "qty": pos["qty"],
+                    "pnl": pnl, "reason": "end_of_period",
+                    "pnl_pct": (sell_price / pos["entry"] - 1) * 100,
+                })
 
         equity_df = pd.DataFrame(equity).set_index("date")
         trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
@@ -278,10 +294,7 @@ class BacktestEngine:
             return pd.DataFrame(), pd.DataFrame()
 
         capital     = self.initial_capital
-        position    = 0.0
-        entry_price = 0.0
-        stop_loss   = 0.0
-        take_profit = 0.0
+        positions   = []   # Múltiples posiciones simultáneas
         trades      = []
         equity      = []
         n_windows   = 0
@@ -319,7 +332,8 @@ class BacktestEngine:
                 atr    = float(row.get("ATR", price * 0.02))
                 idx    = df_test.index[i]
 
-                current_value = capital + position * price
+                positions_value = sum(p["qty"] * price for p in positions)
+                current_value = capital + positions_value
                 equity.append({"date": idx, "equity": current_value, "price": price})
 
                 try:
@@ -328,79 +342,76 @@ class BacktestEngine:
                 except Exception:
                     ml_prob = 0.5
 
-                if position > 0:
-                    if price <= stop_loss:
-                        sell_price = self._apply_transaction_cost(price, "sell")
-                        pnl = (sell_price - entry_price) * position
-                        capital += position * sell_price
-                        trades.append({
-                            "ticker": ticker, "entry_date": entry_date,
-                            "exit_date": idx, "entry": entry_price,
-                            "exit": sell_price, "qty": position,
-                            "pnl": pnl, "reason": "stop_loss",
-                            "pnl_pct": (sell_price / entry_price - 1) * 100,
-                            "ml_prob": ml_prob, "wf_window": n_windows,
-                        })
-                        position = 0.0
+                # ── Gestionar posiciones abiertas ─────────────────────────
+                closed = []
+                for j, pos in enumerate(positions):
+                    pos["high_water"] = max(pos["high_water"], price)
+                    sell_reason = None
 
-                    elif price >= take_profit:
-                        sell_price = self._apply_transaction_cost(price, "sell")
-                        pnl = (sell_price - entry_price) * position
-                        capital += position * sell_price
-                        trades.append({
-                            "ticker": ticker, "entry_date": entry_date,
-                            "exit_date": idx, "entry": entry_price,
-                            "exit": sell_price, "qty": position,
-                            "pnl": pnl, "reason": "take_profit",
-                            "pnl_pct": (sell_price / entry_price - 1) * 100,
-                            "ml_prob": ml_prob, "wf_window": n_windows,
-                        })
-                        position = 0.0
-
+                    if price <= pos["stop"]:
+                        sell_reason = "stop_loss"
+                    elif BT_CONFIG["trailing_stop"] and price > pos["entry"]:
+                        trailing_stop = pos["high_water"] - atr * BT_CONFIG["trailing_atr_mult"]
+                        if trailing_stop > pos["stop"] and price <= trailing_stop:
+                            sell_reason = "trailing_stop"
+                    elif price >= pos["tp"]:
+                        sell_reason = "take_profit"
                     elif ml_prob < 0.35:
+                        sell_reason = "ml_sell"
+
+                    if sell_reason:
                         sell_price = self._apply_transaction_cost(price, "sell")
-                        pnl = (sell_price - entry_price) * position
-                        capital += position * sell_price
+                        pnl = (sell_price - pos["entry"]) * pos["qty"]
+                        capital += pos["qty"] * sell_price
                         trades.append({
-                            "ticker": ticker, "entry_date": entry_date,
-                            "exit_date": idx, "entry": entry_price,
-                            "exit": sell_price, "qty": position,
-                            "pnl": pnl, "reason": "ml_sell",
-                            "pnl_pct": (sell_price / entry_price - 1) * 100,
+                            "ticker": ticker, "entry_date": pos["date"],
+                            "exit_date": idx, "entry": pos["entry"],
+                            "exit": sell_price, "qty": pos["qty"],
+                            "pnl": pnl, "reason": sell_reason,
+                            "pnl_pct": (sell_price / pos["entry"] - 1) * 100,
                             "ml_prob": ml_prob, "wf_window": n_windows,
                         })
-                        position = 0.0
+                        closed.append(j)
 
-                elif position == 0 and ml_prob >= BT_CONFIG["min_ml_prob"]:
+                for j in sorted(closed, reverse=True):
+                    positions.pop(j)
+
+                # ── Nueva entrada ────────────────────────────────────────
+                if (len(positions) < BT_CONFIG["max_positions"]
+                        and ml_prob >= BT_CONFIG["min_ml_prob"]):
                     buy_price     = self._apply_transaction_cost(price, "buy")
-                    trade_capital = capital * BT_CONFIG["position_pct"]
+                    trade_capital = current_value * BT_CONFIG["position_pct"]
+                    max_trade     = current_value * BT_CONFIG["max_position_pct"]
+                    trade_capital = min(trade_capital, max_trade)
                     qty           = trade_capital / buy_price
 
                     if qty * buy_price <= capital:
-                        position    = qty
-                        capital    -= qty * buy_price
-                        entry_price = buy_price
-                        entry_date  = idx
-                        stop_loss   = buy_price - atr * BT_CONFIG["stop_loss_atr_mult"]
-                        take_profit = buy_price + atr * BT_CONFIG["take_profit_atr_mult"]
+                        capital -= qty * buy_price
+                        positions.append({
+                            "qty": qty, "entry": buy_price, "date": idx,
+                            "stop": buy_price - atr * BT_CONFIG["stop_loss_atr_mult"],
+                            "tp": buy_price + atr * BT_CONFIG["take_profit_atr_mult"],
+                            "high_water": buy_price,
+                        })
 
             # Avanzar ventana
             start = end
 
         # Cierre final
-        if position > 0:
+        if positions:
             last_price = float(df["Close"].iloc[-1])
-            sell_price = self._apply_transaction_cost(last_price, "sell")
-            pnl = (sell_price - entry_price) * position
-            capital += position * sell_price
-            trades.append({
-                "ticker": ticker, "entry_date": entry_date,
-                "exit_date": df.index[-1], "entry": entry_price,
-                "exit": sell_price, "qty": position,
-                "pnl": pnl, "reason": "end_of_period",
-                "pnl_pct": (sell_price / entry_price - 1) * 100,
-                "ml_prob": 0.5, "wf_window": n_windows,
-            })
+            for pos in positions:
+                sell_price = self._apply_transaction_cost(last_price, "sell")
+                pnl = (sell_price - pos["entry"]) * pos["qty"]
+                capital += pos["qty"] * sell_price
+                trades.append({
+                    "ticker": ticker, "entry_date": pos["date"],
+                    "exit_date": df.index[-1], "entry": pos["entry"],
+                    "exit": sell_price, "qty": pos["qty"],
+                    "pnl": pnl, "reason": "end_of_period",
+                    "pnl_pct": (sell_price / pos["entry"] - 1) * 100,
+                    "ml_prob": 0.5, "wf_window": n_windows,
+                })
 
         logger.info(f"  ✅ Walk-Forward completado: {n_windows} ventanas de re-entrenamiento")
 
