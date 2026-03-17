@@ -29,7 +29,12 @@ import numpy as np
 import yfinance as yf
 import pytz
 
+from core.circuit_breaker import CircuitBreaker
+
 logger = logging.getLogger("PatoQuant.Agent")
+
+# Timeout para yfinance — evita que Railway se cuelgue
+_YF_TIMEOUT = 5  # segundos
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UNIVERSO DE ACTIVOS
@@ -110,6 +115,10 @@ class ProactiveAgent:
         self.cache_timestamp: Optional[datetime] = None
         self.cache_ttl_minutes = 30
 
+        # Circuit breakers
+        self.yf_breaker = CircuitBreaker("yfinance", failure_threshold=10, cooldown_seconds=300)
+        self.groq_breaker = CircuitBreaker("groq", failure_threshold=3, cooldown_seconds=600)
+
         logger.info("🤖 Agente Proactivo inicializado")
         logger.info(f"   Universo total: {len(FULL_UNIVERSE)} activos")
         logger.info(f"   Máximo watchlist: {self.max_size}")
@@ -144,12 +153,18 @@ class ProactiveAgent:
         Descarga datos y calcula score rápido sin usar TechnicalAnalyzer completo.
         Optimizado para escanear el universo completo en poco tiempo.
         """
+        if not self.yf_breaker.can_execute():
+            return None
+
         try:
             df = yf.download(ticker, period="3mo", interval="1d",
-                             progress=False, auto_adjust=True)
+                             progress=False, auto_adjust=True,
+                             timeout=_YF_TIMEOUT)
 
             if df is None or len(df) < 20:
                 return None
+
+            self.yf_breaker.record_success()
 
             close = df["Close"].squeeze()
             volume = df["Volume"].squeeze()
@@ -231,6 +246,7 @@ class ProactiveAgent:
             }
 
         except Exception as e:
+            self.yf_breaker.record_failure()
             logger.debug(f"Quick score falló para {ticker}: {e}")
             return None
 
@@ -281,6 +297,10 @@ class ProactiveAgent:
             logger.warning("⚠️ Sin GROQ_API_KEY — omitiendo trending")
             return []
 
+        if not self.groq_breaker.can_execute():
+            logger.info("🔌 Groq circuit breaker abierto — omitiendo trending")
+            return []
+
         try:
             tz = pytz.timezone("America/New_York")
             today = datetime.now(tz).strftime("%Y-%m-%d %A")
@@ -319,9 +339,11 @@ Solo tickers válidos de Yahoo Finance."""
             )
 
             if not response.ok:
+                self.groq_breaker.record_failure()
                 logger.warning(f"⚠️ Groq error: {response.status_code}")
                 return []
 
+            self.groq_breaker.record_success()
             content = response.json()["choices"][0]["message"]["content"].strip()
 
             # Parsear JSON de la respuesta
@@ -335,6 +357,7 @@ Solo tickers válidos de Yahoo Finance."""
                 return valid
 
         except Exception as e:
+            self.groq_breaker.record_failure()
             logger.warning(f"⚠️ Error consultando Groq para trending: {e}")
 
         return []
