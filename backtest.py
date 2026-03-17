@@ -243,9 +243,19 @@ class BacktestEngine:
     def run_ml(self, ticker: str,
                 df_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Backtesting del modelo ML.
-        Entrena con los primeros 60% de datos, testea en el 40% restante.
-        Esto replica exactamente cómo se usaría en producción.
+        Backtesting Walk-Forward del modelo ML.
+
+        En lugar de un solo split 60/40, divide los datos en ventanas
+        rolling donde el modelo se re-entrena periódicamente con datos
+        pasados y se testea en datos futuros que nunca ha visto.
+
+        Ventanas:
+          - Train: 252 días (1 año) de datos pasados
+          - Test:  63 días (1 trimestre) futuros
+          - El modelo se re-entrena cada 63 días (avanza la ventana)
+
+        Esto replica exactamente cómo se usaría en producción:
+        el modelo NUNCA ve datos futuros durante el entrenamiento.
         """
         try:
             from ml_model import AdvancedTradingMLModel
@@ -256,121 +266,140 @@ class BacktestEngine:
         df = DataProcessor.prepare_full_analysis(df_full, self.analyzer)
         df = df.dropna().copy()
 
-        # Split temporal: 60% train, 40% test
-        split_idx  = int(len(df) * 0.60)
-        df_train   = df.iloc[:split_idx]
-        df_test    = df.iloc[split_idx:]
+        TRAIN_DAYS = 252   # 1 año de training
+        TEST_DAYS  = 63    # 1 trimestre de test (re-entrena cada trimestre)
+        MIN_TRAIN  = 150
 
-        if len(df_train) < 150 or len(df_test) < 50:
-            logger.warning(f"  {ticker}: datos insuficientes para ML backtest")
+        if len(df) < TRAIN_DAYS + TEST_DAYS:
+            logger.warning(f"  {ticker}: datos insuficientes para walk-forward ML backtest")
             return pd.DataFrame(), pd.DataFrame()
 
-        # Entrenar modelo
-        logger.info(f"  🎓 Entrenando ML para {ticker} ({len(df_train)} días train)...")
-        try:
-            model = AdvancedTradingMLModel(prediction_days=5, threshold=2.0)
-            model.train(df_train, test_size=0.2)
-        except Exception as e:
-            logger.warning(f"  ⚠️  ML train falló para {ticker}: {e}")
-            return pd.DataFrame(), pd.DataFrame()
-
-        # Simular trades en período de test
-        capital    = self.initial_capital
-        position   = 0.0
+        capital     = self.initial_capital
+        position    = 0.0
         entry_price = 0.0
-        stop_loss  = 0.0
+        stop_loss   = 0.0
         take_profit = 0.0
-        trades     = []
-        equity     = []
+        trades      = []
+        equity      = []
+        n_windows   = 0
 
-        for i in range(30, len(df_test)):
-            window = df_test.iloc[max(0, i - 60):i + 1]
-            row    = df_test.iloc[i]
-            price  = float(row["Close"])
-            atr    = float(row.get("ATR", price * 0.02))
-            idx    = df_test.index[i]
+        # Walk-Forward: avanzar ventana de training+test
+        start = TRAIN_DAYS
+        while start + 30 < len(df):  # Al menos 30 días de test
+            end = min(start + TEST_DAYS, len(df))
+            df_train = df.iloc[:start]
+            df_test  = df.iloc[start:end]
 
-            current_value = capital + position * price
-            equity.append({"date": idx, "equity": current_value, "price": price})
+            if len(df_train) < MIN_TRAIN:
+                start = end
+                continue
 
-            # Predicción ML
+            # Re-entrenar modelo con datos hasta 'start'
             try:
-                pred    = model.predict(window)
-                ml_prob = float(pred.get("probability_up", 0.5))
-            except Exception:
-                ml_prob = 0.5
+                model = AdvancedTradingMLModel(prediction_days=5, threshold=2.0)
+                model.train(df_train, test_size=0.2)
+                n_windows += 1
+                logger.info(
+                    f"  🔄 Walk-Forward ventana {n_windows}: "
+                    f"train={len(df_train)}d, test={len(df_test)}d"
+                )
+            except Exception as e:
+                logger.warning(f"  ⚠️  ML train falló ventana {n_windows}: {e}")
+                start = end
+                continue
 
-            # Gestión de posición
-            if position > 0:
-                if price <= stop_loss:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "stop_loss",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                        "ml_prob": ml_prob,
-                    })
-                    position = 0.0
+            # Simular trades en ventana de test
+            for i in range(30, len(df_test)):
+                window = df_test.iloc[max(0, i - 60):i + 1]
+                row    = df_test.iloc[i]
+                price  = float(row["Close"])
+                atr    = float(row.get("ATR", price * 0.02))
+                idx    = df_test.index[i]
 
-                elif price >= take_profit:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "take_profit",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                        "ml_prob": ml_prob,
-                    })
-                    position = 0.0
+                current_value = capital + position * price
+                equity.append({"date": idx, "equity": current_value, "price": price})
 
-                elif ml_prob < 0.35:
-                    sell_price = self._apply_transaction_cost(price, "sell")
-                    pnl = (sell_price - entry_price) * position
-                    capital += position * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": entry_date,
-                        "exit_date": idx, "entry": entry_price,
-                        "exit": sell_price, "qty": position,
-                        "pnl": pnl, "reason": "ml_sell",
-                        "pnl_pct": (sell_price / entry_price - 1) * 100,
-                        "ml_prob": ml_prob,
-                    })
-                    position = 0.0
+                try:
+                    pred    = model.predict(window)
+                    ml_prob = float(pred.get("probability_up", 0.5))
+                except Exception:
+                    ml_prob = 0.5
 
-            elif position == 0 and ml_prob >= BT_CONFIG["min_ml_prob"]:
-                buy_price     = self._apply_transaction_cost(price, "buy")
-                trade_capital = capital * BT_CONFIG["position_pct"]
-                qty           = trade_capital / buy_price
+                if position > 0:
+                    if price <= stop_loss:
+                        sell_price = self._apply_transaction_cost(price, "sell")
+                        pnl = (sell_price - entry_price) * position
+                        capital += position * sell_price
+                        trades.append({
+                            "ticker": ticker, "entry_date": entry_date,
+                            "exit_date": idx, "entry": entry_price,
+                            "exit": sell_price, "qty": position,
+                            "pnl": pnl, "reason": "stop_loss",
+                            "pnl_pct": (sell_price / entry_price - 1) * 100,
+                            "ml_prob": ml_prob, "wf_window": n_windows,
+                        })
+                        position = 0.0
 
-                if qty * buy_price <= capital:
-                    position    = qty
-                    capital    -= qty * buy_price
-                    entry_price = buy_price
-                    entry_date  = idx
-                    stop_loss   = buy_price - atr * BT_CONFIG["stop_loss_atr_mult"]
-                    take_profit = buy_price + atr * BT_CONFIG["take_profit_atr_mult"]
+                    elif price >= take_profit:
+                        sell_price = self._apply_transaction_cost(price, "sell")
+                        pnl = (sell_price - entry_price) * position
+                        capital += position * sell_price
+                        trades.append({
+                            "ticker": ticker, "entry_date": entry_date,
+                            "exit_date": idx, "entry": entry_price,
+                            "exit": sell_price, "qty": position,
+                            "pnl": pnl, "reason": "take_profit",
+                            "pnl_pct": (sell_price / entry_price - 1) * 100,
+                            "ml_prob": ml_prob, "wf_window": n_windows,
+                        })
+                        position = 0.0
+
+                    elif ml_prob < 0.35:
+                        sell_price = self._apply_transaction_cost(price, "sell")
+                        pnl = (sell_price - entry_price) * position
+                        capital += position * sell_price
+                        trades.append({
+                            "ticker": ticker, "entry_date": entry_date,
+                            "exit_date": idx, "entry": entry_price,
+                            "exit": sell_price, "qty": position,
+                            "pnl": pnl, "reason": "ml_sell",
+                            "pnl_pct": (sell_price / entry_price - 1) * 100,
+                            "ml_prob": ml_prob, "wf_window": n_windows,
+                        })
+                        position = 0.0
+
+                elif position == 0 and ml_prob >= BT_CONFIG["min_ml_prob"]:
+                    buy_price     = self._apply_transaction_cost(price, "buy")
+                    trade_capital = capital * BT_CONFIG["position_pct"]
+                    qty           = trade_capital / buy_price
+
+                    if qty * buy_price <= capital:
+                        position    = qty
+                        capital    -= qty * buy_price
+                        entry_price = buy_price
+                        entry_date  = idx
+                        stop_loss   = buy_price - atr * BT_CONFIG["stop_loss_atr_mult"]
+                        take_profit = buy_price + atr * BT_CONFIG["take_profit_atr_mult"]
+
+            # Avanzar ventana
+            start = end
 
         # Cierre final
         if position > 0:
-            last_price = float(df_test["Close"].iloc[-1])
+            last_price = float(df["Close"].iloc[-1])
             sell_price = self._apply_transaction_cost(last_price, "sell")
             pnl = (sell_price - entry_price) * position
             capital += position * sell_price
             trades.append({
                 "ticker": ticker, "entry_date": entry_date,
-                "exit_date": df_test.index[-1], "entry": entry_price,
+                "exit_date": df.index[-1], "entry": entry_price,
                 "exit": sell_price, "qty": position,
                 "pnl": pnl, "reason": "end_of_period",
                 "pnl_pct": (sell_price / entry_price - 1) * 100,
-                "ml_prob": 0.5,
+                "ml_prob": 0.5, "wf_window": n_windows,
             })
+
+        logger.info(f"  ✅ Walk-Forward completado: {n_windows} ventanas de re-entrenamiento")
 
         equity_df = pd.DataFrame(equity).set_index("date") if equity else pd.DataFrame()
         trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()

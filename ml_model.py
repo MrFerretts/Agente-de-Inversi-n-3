@@ -7,6 +7,8 @@ FIXES 2026-03-17:
   - Target sin data leakage (mantiene corrección anterior)
   - Split temporal sin shuffle (mantiene corrección anterior)
   - TimeSeriesSplit walk-forward (mantiene corrección anterior)
+  - Features reducidos de 70+ a ~20 (anti-overfitting, más robusto)
+  - RF con menos árboles y profundidad limitada para generalización
 """
 
 import pandas as pd
@@ -95,23 +97,31 @@ class AdvancedTradingMLModel:
     # ─────────────────────────────────────────────────────────────────────────
 
     def create_advanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Features reducidos a ~20 para evitar overfitting.
+        Solo se mantienen los más robustos y con mayor poder predictivo:
+          - RSI 14 (momentum principal)
+          - Distancia a SMA20 y SMA50 (tendencia)
+          - SMA Cross 50/200 (golden/death cross)
+          - ATR 14 normalizado (volatilidad)
+          - Volatilidad histórica 20d (régimen de vol)
+          - RVOL 20 (volumen relativo)
+          - Returns 1d, 5d, 20d (momentum multi-escala)
+          - Position in 20D range (soporte/resistencia)
+          - MACD Hist, ADX, StochRSI, BB_Width (ya calculados)
+        """
         data = df.copy()
 
-        # RSI multi-timeframe
-        for period in [7, 14, 21]:
+        # RSI 14 (el estándar — un solo periodo es suficiente)
+        if 'RSI_14' not in data.columns:
             delta = data['Close'].diff()
-            gain  = delta.where(delta > 0, 0).ewm(alpha=1/period, adjust=False).mean()
-            loss  = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+            gain  = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+            loss  = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
             rs    = gain / (loss + 1e-9)
-            data[f'RSI_{period}'] = 100 - (100 / (1 + rs))
+            data['RSI_14'] = 100 - (100 / (1 + rs))
 
-        data['RSI_Divergence'] = (
-            (data['Close'].pct_change(20) < 0) &
-            (data[f'RSI_14'].diff(20) > 0)
-        ).astype(int)
-
-        # Distancias a SMAs
-        for period in [10, 20, 50, 100, 200]:
+        # Distancias a SMA20 y SMA50 (las dos más predictivas)
+        for period in [20, 50]:
             col = f'SMA{period}'
             if col not in data.columns:
                 data[col] = data['Close'].rolling(period).mean()
@@ -127,55 +137,36 @@ class AdvancedTradingMLModel:
             (data['SMA50'] < data['SMA200']).astype(int)
         )
 
-        # ATR normalizado multi-periodo
-        for period in [7, 14, 21]:
+        # ATR 14 normalizado (un solo periodo)
+        if 'ATR_14' not in data.columns or 'ATR_14_Norm' not in data.columns:
             hl  = data['High'] - data['Low']
             hc  = (data['High'] - data['Close'].shift()).abs()
             lc  = (data['Low']  - data['Close'].shift()).abs()
             tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-            atr = tr.ewm(alpha=1/period, adjust=False).mean()
-            data[f'ATR_{period}']      = atr
-            data[f'ATR_{period}_Norm'] = atr / data['Close']
+            data['ATR_14']      = tr.ewm(alpha=1/14, adjust=False).mean()
+        data['ATR_14_Norm'] = data['ATR_14'] / data['Close']
 
-        # Volatilidad histórica
-        for period in [10, 20, 30]:
-            data[f'HV_{period}'] = data['Returns'].rolling(period).std() * np.sqrt(252) * 100
-        data['Vol_Ratio'] = data['HV_20'] / (data['HV_20'].rolling(50).mean() + 1e-9)
+        # Volatilidad histórica 20d
+        if 'Returns' not in data.columns:
+            data['Returns'] = data['Close'].pct_change()
+        data['HV_20'] = data['Returns'].rolling(20).std() * np.sqrt(252) * 100
 
-        # RVOL multi-periodo
-        for period in [10, 20, 30]:
-            avg = data['Volume'].rolling(period).mean()
-            data[f'RVOL_{period}'] = data['Volume'] / (avg + 1e-9)
-        data['Vol_High_Range'] = (
-            data['Close'] > data['Low'] + (data['High'] - data['Low']) * 0.66
-        ).astype(int)
+        # RVOL 20 (un solo periodo)
+        if 'RVOL_20' not in data.columns:
+            avg = data['Volume'].rolling(20).mean()
+            data['RVOL_20'] = data['Volume'] / (avg + 1e-9)
 
-        # Retornos multi-periodo
-        for period in [1, 3, 5, 10, 20, 30]:
+        # Retornos: 1d, 5d, 20d (corto, medio, largo)
+        for period in [1, 5, 20]:
             data[f'Return_{period}D'] = data['Close'].pct_change(period) * 100
 
-        # Rangos de precio
-        for period in [5, 10, 20]:
-            data[f'High_{period}D']  = data['High'].rolling(period).max()
-            data[f'Low_{period}D']   = data['Low'].rolling(period).min()
-            data[f'Range_{period}D'] = (
-                (data[f'High_{period}D'] - data[f'Low_{period}D']) / data['Close'] * 100
-            )
+        # Posición en rango de 20 días (¿cerca de soporte o resistencia?)
+        data['High_20D'] = data['High'].rolling(20).max()
+        data['Low_20D']  = data['Low'].rolling(20).min()
         data['Position_in_Range_20D'] = (
             (data['Close'] - data['Low_20D']) /
             (data['High_20D'] - data['Low_20D'] + 1e-9)
         )
-
-        # Patrones de velas
-        body  = (data['Close'] - data['Open']).abs()
-        rng   = data['High'] - data['Low']
-        data['Is_Doji']        = (body / (rng + 1e-9) < 0.1).astype(int)
-        data['Is_Large_Candle'] = (body / (rng + 1e-9) > 0.7).astype(int)
-
-        # Features de interacción
-        data['RSI_x_ADX']    = data['RSI_14'] * data['ADX'] / 100
-        data['RVOL_x_Return'] = data['RVOL_20'] * data['Return_1D']
-        data['BB_ATR_Ratio']  = data['BB_Width'] / (data['ATR_14'] / data['Close'])
 
         return data
 
@@ -210,19 +201,16 @@ class AdvancedTradingMLModel:
         ) * 100
         df['Target'] = (df['Future_Return'] > self.threshold).astype(int)
 
+        # ~20 features robustos — anti-overfitting
         feature_columns = [
-            'RSI_7', 'RSI_14', 'RSI_21', 'RSI_Divergence',
-            'Dist_SMA10', 'Dist_SMA20', 'Dist_SMA50', 'Dist_SMA100', 'Dist_SMA200',
+            'RSI_14',
+            'Dist_SMA20', 'Dist_SMA50',
             'SMA_Cross_50_200',
-            'ATR_7_Norm', 'ATR_14_Norm', 'ATR_21_Norm',
-            'HV_10', 'HV_20', 'HV_30', 'Vol_Ratio',
-            'RVOL_10', 'RVOL_20', 'RVOL_30', 'Vol_High_Range',
-            'Return_1D', 'Return_3D', 'Return_5D', 'Return_10D',
-            'Return_20D', 'Return_30D',
-            'Range_5D', 'Range_10D', 'Range_20D',
+            'ATR_14_Norm',
+            'HV_20',
+            'RVOL_20',
+            'Return_1D', 'Return_5D', 'Return_20D',
             'Position_in_Range_20D',
-            'Is_Doji', 'Is_Large_Candle',
-            'RSI_x_ADX', 'RVOL_x_Return', 'BB_ATR_Ratio',
             'MACD_Hist', 'ADX', 'StochRSI', 'BB_Width',
         ]
 
@@ -261,8 +249,8 @@ class AdvancedTradingMLModel:
         # ── Random Forest ─────────────────────────────────────────────────────
         print("\n🌲 1/3 Random Forest...")
         self.rf_model = RandomForestClassifier(
-            n_estimators=200, max_depth=15,
-            min_samples_split=10, min_samples_leaf=5,
+            n_estimators=100, max_depth=8,
+            min_samples_split=20, min_samples_leaf=10,
             random_state=42, n_jobs=-1
         )
         self.rf_model.fit(X_train, y_train)
@@ -274,9 +262,10 @@ class AdvancedTradingMLModel:
         if XGBOOST_AVAILABLE:
             print("\n🚀 2/3 XGBoost...")
             self.xgb_model = XGBClassifier(
-                n_estimators=100, max_depth=6,
-                learning_rate=0.1, subsample=0.8,
-                colsample_bytree=0.8, random_state=42,
+                n_estimators=80, max_depth=4,
+                learning_rate=0.05, subsample=0.7,
+                colsample_bytree=0.7, reg_alpha=0.1, reg_lambda=1.0,
+                random_state=42,
                 use_label_encoder=False, eval_metric='logloss', n_jobs=-1
             )
             self.xgb_model.fit(X_train, y_train)
