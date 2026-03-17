@@ -36,31 +36,31 @@ logger = logging.getLogger("PatoQuant.Trader")
 
 RISK_CONFIG = {
     # ── Tamaño de posición ────────────────────────────────────────────────────
-    "position_pct":        0.05,    # 5% del portafolio por trade
-    "max_position_pct":    0.10,    # Nunca más del 10% en un solo activo
+    "position_pct":        0.08,    # 8% del portafolio por trade (riesgo en ATR)
+    "max_position_pct":    0.20,    # Hasta 20% en un solo activo
     "min_position_usd":    50.0,    # Mínimo $50 por trade (evitar comisiones)
 
     # ── Stop Loss / Take Profit dinámicos (basados en ATR) ────────────────────
-    "stop_loss_atr_mult":  2.0,     # Stop = precio_entrada - (ATR * 2.0)
-    "take_profit_atr_mult": 4.0,    # TP   = precio_entrada + (ATR * 4.0) → R:R 1:2
+    "stop_loss_atr_mult":  1.5,     # Stop = precio_entrada - (ATR * 1.5) — más ajustado
+    "take_profit_atr_mult": 3.0,    # TP   = precio_entrada + (ATR * 3.0) → R:R 1:2
     "trailing_stop":       True,    # Activar trailing stop
-    "trailing_atr_mult":   1.5,     # Trailing = precio_max - (ATR * 1.5)
+    "trailing_atr_mult":   1.2,     # Trailing = precio_max - (ATR * 1.2)
 
     # ── Filtros de entrada ────────────────────────────────────────────────────
-    "min_score":           55,      # Score técnico mínimo para comprar
-    "min_adx":             20,      # Tendencia mínima confirmada
-    "max_rsi_entry":       72,      # No comprar en sobrecompra extrema
-    "min_rsi_entry":       25,      # No comprar en caída libre
+    "min_score":           35,      # Score técnico mínimo (antes 55 — casi nada pasaba)
+    "min_adx":             18,      # Tendencia mínima confirmada
+    "max_rsi_entry":       75,      # No comprar en sobrecompra extrema
+    "min_rsi_entry":       22,      # No comprar en caída libre
     "require_market_open": True,    # Solo operar en horario regular
 
     # ── Gestión de riesgo del portafolio ──────────────────────────────────────
     "max_drawdown_pct":    0.15,    # Pausar si portafolio cae 15% desde pico
     "max_daily_loss_pct":  0.05,    # Pausar si pierde 5% en el día
-    "max_total_exposure":  0.80,    # Máximo 80% del portafolio invertido
+    "max_total_exposure":  0.90,    # Máximo 90% del portafolio invertido
 
     # ── Cooldown ─────────────────────────────────────────────────────────────
-    "trade_cooldown_hours": 4,      # Esperar 4h antes de re-entrar en mismo ticker
-    "max_trades_per_day":  10,      # Máximo 10 operaciones por día
+    "trade_cooldown_hours": 2,      # 2h cooldown (antes 4h — perdía re-entradas)
+    "max_trades_per_day":  15,      # Máximo 15 operaciones por día
 
     # ── Correlación sectorial ────────────────────────────────────────────────
     "max_positions_per_sector": 3,  # Máximo 3 posiciones en el mismo sector
@@ -404,10 +404,18 @@ class TradingBrain:
         rvol    = float(scan_result.get("rvol", 1))
         rec     = scan_result.get("recommendation", "")
 
-        # ── 1. Filtros básicos ────────────────────────────────────────────────
+        # ── 1. Filtros básicos (threshold dinámico según tendencia) ──────────
 
-        if score < RISK_CONFIG["min_score"]:
-            return False, f"Score insuficiente ({score:.0f} < {RISK_CONFIG['min_score']})"
+        # Usar SMA cross del scan para ajustar threshold
+        trend = scan_result.get("trend", "NEUTRAL")
+        sma_cross = scan_result.get("sma_cross", "")
+        if trend == "BULLISH" or "GOLDEN" in str(sma_cross).upper():
+            min_score = RISK_CONFIG["min_score"] - 5   # Más permisivo en alcista
+        else:
+            min_score = RISK_CONFIG["min_score"] + 5   # Más estricto sin tendencia
+
+        if score < min_score:
+            return False, f"Score insuficiente ({score:.0f} < {min_score})"
 
         if rsi > RISK_CONFIG["max_rsi_entry"]:
             return False, f"RSI sobrecomprado ({rsi:.1f})"
@@ -418,7 +426,7 @@ class TradingBrain:
         if adx < RISK_CONFIG["min_adx"]:
             return False, f"Tendencia débil (ADX {adx:.1f})"
 
-        if rec not in ("COMPRA", "COMPRA FUERTE"):
+        if rec not in ("COMPRA", "COMPRA FUERTE", "NEUTRAL ALCISTA"):
             return False, f"Señal no alcista ({rec})"
 
         # ── 2. Cooldown por ticker ────────────────────────────────────────────
@@ -554,12 +562,27 @@ class TradingBrain:
         # Recuperar ATR del scan para trailing stop
         atr = float(scan_result.get("atr", current_val * 0.02))
 
-        # ── Stop loss dinámico ────────────────────────────────────────────────
+        # ── Stop loss fijo (desde entrada) ────────────────────────────────────
         stop_distance = atr * RISK_CONFIG["stop_loss_atr_mult"]
         stop_price    = entry_price - stop_distance
 
         if current_val <= stop_price:
             return True, f"Stop loss activado (precio {current_val:.2f} ≤ stop {stop_price:.2f})"
+
+        # ── Trailing stop dinámico ────────────────────────────────────────────
+        # El trailing stop se activa cuando ya estamos en ganancia
+        if RISK_CONFIG["trailing_stop"] and current_val > entry_price:
+            # Usar el máximo observado (Alpaca no da high_water, usamos unrealized)
+            high_water = entry_price * (1 + max(unrealized, 0) / 100)
+            trailing_distance = atr * RISK_CONFIG["trailing_atr_mult"]
+            trailing_stop = high_water - trailing_distance
+
+            # Solo aplica trailing si es más alto que el stop fijo
+            if trailing_stop > stop_price and current_val <= trailing_stop:
+                return True, (
+                    f"Trailing stop activado (precio {current_val:.2f} "
+                    f"≤ trail {trailing_stop:.2f} | ganancia máx +{unrealized:.1f}%)"
+                )
 
         # ── Take profit ───────────────────────────────────────────────────────
         tp_distance = atr * RISK_CONFIG["take_profit_atr_mult"]
@@ -569,11 +592,11 @@ class TradingBrain:
             return True, f"Take profit alcanzado (+{unrealized:.1f}% | TP {tp_price:.2f})"
 
         # ── Señal técnica bajista fuerte ──────────────────────────────────────
-        if rec in ("VENTA", "VENTA FUERTE") and score <= -40:
+        if rec in ("VENTA", "VENTA FUERTE") and score <= -30:
             return True, f"Señal bajista fuerte (Score {score:.0f})"
 
         # ── RSI sobrecomprado extremo ─────────────────────────────────────────
-        if rsi > 78 and unrealized > 5:
+        if rsi > 80 and unrealized > 8:
             return True, f"RSI sobrecomprado ({rsi:.1f}) con ganancia ({unrealized:.1f}%)"
 
         # ── Pérdida máxima tolerada ───────────────────────────────────────────
