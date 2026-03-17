@@ -2,6 +2,7 @@
 Módulo de Datos de Mercado (Versión Quant con Macro y Sentimiento)
 Integra precios, datos fundamentales y "Sensores Macro" (VIX, Bonos).
 ACTUALIZADO: 2026-03-17 - Cache en get_market_regime + descarga paralela
+FIX: Timeouts + cache TTL adaptativo (5 min en horario, 30 min fuera)
 """
 
 import time
@@ -14,12 +15,28 @@ from typing import Dict, List, Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Timeout global para yfinance
+_YF_TIMEOUT = 10  # segundos
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CACHE GLOBAL para get_market_regime
-# Evita descargar 6 meses de datos en cada scan (cada 5 min = 288 veces/día)
 # ─────────────────────────────────────────────────────────────────────────────
 _regime_cache = {"data": None, "ts": None}
-_REGIME_TTL_SECONDS = 1800  # 30 minutos
+_REGIME_TTL_MARKET_HOURS = 300   # 5 min durante horario de mercado
+_REGIME_TTL_AFTER_HOURS = 1800   # 30 min fuera de horario
+
+
+def _get_regime_ttl() -> int:
+    """TTL adaptativo: 5 min en horario, 30 min fuera."""
+    try:
+        import pytz
+        tz = pytz.timezone("America/New_York")
+        now = datetime.now(tz)
+        if now.weekday() < 5 and 9 <= now.hour < 16:
+            return _REGIME_TTL_MARKET_HOURS
+    except Exception:
+        pass
+    return _REGIME_TTL_AFTER_HOURS
 
 
 class MarketDataFetcher:
@@ -40,39 +57,86 @@ class MarketDataFetcher:
         FIX: Cachea el resultado 30 minutos para evitar descargar 6 meses
         de datos de 4 tickers en cada scan (288 veces/día).
         """
-        # Verificar caché
+        # Verificar caché con TTL adaptativo
+        ttl = _get_regime_ttl()
         if (_regime_cache["ts"] is not None and
-                time.time() - _regime_cache["ts"] < _REGIME_TTL_SECONDS):
+                time.time() - _regime_cache["ts"] < ttl):
             return _regime_cache["data"]
 
         try:
-            tickers = ['^VIX', '^TNX', 'SPY', 'BTC-USD']
-            data = yf.download(tickers, period='6mo', progress=False)['Close']
+            # Indicadores macro ampliados: VIX, Bonos 10Y, SPY, BTC, HYG (high yield)
+            tickers = ['^VIX', '^TNX', 'SPY', 'BTC-USD', 'HYG']
+            data = yf.download(tickers, period='6mo', progress=False,
+                               timeout=_YF_TIMEOUT)['Close']
             data = data.ffill().dropna()
 
             current_vix = data['^VIX'].iloc[-1]
             spy_price   = data['SPY'].iloc[-1]
             spy_sma200  = data['SPY'].rolling(120).mean().iloc[-1]
-            btc_price   = data['BTC-USD'].iloc[-1]
-            btc_sma50   = data['BTC-USD'].rolling(50).mean().iloc[-1]
 
             macro_score = 0
-            if current_vix < 20:   macro_score += 1
-            elif current_vix > 30: macro_score -= 2
-            if spy_price > spy_sma200: macro_score += 1
-            else:                      macro_score -= 1
-            if btc_price > btc_sma50:  macro_score += 1
 
-            regime = "NEUTRAL"
-            if macro_score >= 2:   regime = "RISK_ON"
-            elif macro_score <= -1: regime = "RISK_OFF"
+            # 1. VIX (volatilidad implícita)
+            if current_vix < 15:   macro_score += 2   # Muy calmado
+            elif current_vix < 20: macro_score += 1
+            elif current_vix > 35: macro_score -= 3   # Crisis
+            elif current_vix > 30: macro_score -= 2
+            elif current_vix > 25: macro_score -= 1
+
+            # 2. SPY vs SMA200 (tendencia principal)
+            if spy_price > spy_sma200:
+                macro_score += 1
+            else:
+                macro_score -= 1
+
+            # 3. VIX trend (¿subiendo o bajando?)
+            vix_sma10 = data['^VIX'].rolling(10).mean().iloc[-1]
+            if current_vix < vix_sma10 * 0.95:
+                macro_score += 1   # VIX bajando = mercado calmándose
+            elif current_vix > vix_sma10 * 1.1:
+                macro_score -= 1   # VIX subiendo = miedo creciente
+
+            # 4. Yield curve proxy (bonos 10Y tendencia)
+            if '^TNX' in data.columns:
+                tnx = data['^TNX'].iloc[-1]
+                tnx_sma50 = data['^TNX'].rolling(50).mean().iloc[-1]
+                if tnx < tnx_sma50:
+                    macro_score += 1   # Yields bajando = flight to safety acabando
+                # No penalizar yields subiendo — puede ser por crecimiento
+
+            # 5. High Yield credit spread proxy (HYG = junk bonds ETF)
+            if 'HYG' in data.columns and len(data['HYG'].dropna()) > 50:
+                hyg_price = data['HYG'].iloc[-1]
+                hyg_sma50 = data['HYG'].rolling(50).mean().iloc[-1]
+                if hyg_price > hyg_sma50:
+                    macro_score += 1   # Credit OK, no hay estrés
+                else:
+                    macro_score -= 1   # Credit estrés = risk off
+
+            # 6. BTC (solo como sensor de apetito de riesgo)
+            if 'BTC-USD' in data.columns and len(data['BTC-USD'].dropna()) > 50:
+                btc_price = data['BTC-USD'].iloc[-1]
+                btc_sma50 = data['BTC-USD'].rolling(50).mean().iloc[-1]
+                if btc_price > btc_sma50:
+                    macro_score += 1
+
+            # Clasificar régimen
+            if current_vix > 35:
+                regime = "CRISIS"
+            elif macro_score >= 3:
+                regime = "RISK_ON"
+            elif macro_score <= -2:
+                regime = "RISK_OFF"
+            else:
+                regime = "NEUTRAL"
 
             result = {
                 'regime':      regime,
-                'vix':         current_vix,
+                'vix':         float(current_vix),
+                'vix_trend':   'FALLING' if current_vix < vix_sma10 else 'RISING',
                 'spy_trend':   'BULLISH' if spy_price > spy_sma200 else 'BEARISH',
                 'macro_score': macro_score,
-                'description': f"Mercado en modo {regime} (VIX: {current_vix:.1f})"
+                'description': f"Mercado en modo {regime} (VIX: {current_vix:.1f}, Score: {macro_score})"
             }
 
             # Guardar en caché
@@ -91,7 +155,7 @@ class MarketDataFetcher:
     def get_stock_data(self, symbol: str, period: str = '1mo') -> Optional[pd.DataFrame]:
         try:
             ticker = yf.Ticker(symbol)
-            data   = ticker.history(period=period, auto_adjust=True)
+            data   = ticker.history(period=period, auto_adjust=True, timeout=_YF_TIMEOUT)
             if data.empty:
                 return None
             data['Symbol']  = symbol
@@ -151,6 +215,7 @@ class MarketDataFetcher:
                 progress=False,
                 group_by='ticker',
                 threads=True,
+                timeout=_YF_TIMEOUT,
             )
 
             data_dict = {}

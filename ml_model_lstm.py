@@ -2,6 +2,11 @@
 LSTM DEEP LEARNING MODULE - Advanced Time Series Prediction
 Sistema de Deep Learning con redes neuronales LSTM para predecir movimientos de precio
 Captura patrones temporales que otros modelos no pueden detectar
+
+FIX 2026-03-17:
+  - Features sincronizados con ml_model.py (~15 features, no 23)
+  - Arquitectura reducida (64→32→16) para Railway (menos RAM)
+  - Error handling en predict()
 """
 
 import pandas as pd
@@ -93,65 +98,92 @@ class LSTMTradingModel:
     
     def prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Prepara features específicos para LSTM
-        
-        Args:
-            df: DataFrame con indicadores básicos
-        
-        Returns:
-            DataFrame con features normalizados
+        Prepara features para LSTM — SINCRONIZADOS con ml_model.py (~15 features).
+
+        Mismos features que el ensemble ML para consistencia entre modelos:
+          RSI_14, Dist_SMA20, Dist_SMA50, SMA_Cross_50_200, ATR_14_Norm,
+          HV_20, RVOL_20, Return_1D, Return_5D, Return_20D,
+          Position_in_Range_20D, MACD_Hist, ADX, StochRSI, BB_Width
         """
         data = df.copy()
-        
-        # ====================================================================
-        # FEATURES PARA LSTM (optimizados para series temporales)
-        # ====================================================================
-        
-        features = pd.DataFrame()
-        
-        # 1. Precio normalizado
-        features['Close_Norm'] = data['Close'] / data['Close'].shift(20)
-        
-        # 2. Retornos
-        for period in [1, 3, 5, 10]:
-            features[f'Return_{period}'] = data['Close'].pct_change(period)
-        
-        # 3. Volatilidad rolling
-        features['Volatility_10'] = data['Returns'].rolling(10).std()
-        features['Volatility_20'] = data['Returns'].rolling(20).std()
-        
-        # 4. Momentum indicators
-        features['RSI'] = data['RSI'] / 100  # Normalizar a [0, 1]
-        features['StochRSI'] = data['StochRSI']
-        
-        # 5. Tendencia
-        features['MACD_Hist_Norm'] = data['MACD_Hist'] / data['Close']
-        features['ADX'] = data['ADX'] / 100
-        
-        # 6. Distancia a medias móviles
-        features['Dist_SMA20'] = (data['Close'] - data['SMA20']) / data['SMA20']
-        features['Dist_SMA50'] = (data['Close'] - data['SMA50']) / data['SMA50']
-        
-        # 7. ATR normalizado
-        features['ATR_Norm'] = data['ATR'] / data['Close']
-        
-        # 8. Volumen relativo
-        features['RVOL'] = data['RVOL']
-        
-        # 9. Bollinger position
-        bb_range = data['BB_Upper'] - data['BB_Lower']
-        features['BB_Position'] = (data['Close'] - data['BB_Lower']) / (bb_range + 1e-9)
-        
-        # 10. Rangos de precio
-        features['High_Low_Range'] = (data['High'] - data['Low']) / data['Close']
-        
-        # 11. Diferencias de precios (cambios)
-        features['Close_Change'] = data['Close'].diff()
-        features['Volume_Change'] = data['Volume'].diff()
-        
-        # 12. Medias móviles de volumen
-        features['Volume_MA_Ratio'] = data['Volume'] / data['Volume'].rolling(20).mean()
-        
+        features = pd.DataFrame(index=data.index)
+
+        # RSI 14 normalizado a [0, 1]
+        if 'RSI' in data.columns:
+            features['RSI_14'] = data['RSI'] / 100
+        elif 'RSI_14' in data.columns:
+            features['RSI_14'] = data['RSI_14'] / 100
+        else:
+            delta = data['Close'].diff()
+            gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+            rs = gain / (loss + 1e-9)
+            features['RSI_14'] = (100 - (100 / (1 + rs))) / 100
+
+        # Distancias a SMAs
+        sma20 = data['SMA20'] if 'SMA20' in data.columns else data['Close'].rolling(20).mean()
+        sma50 = data['SMA50'] if 'SMA50' in data.columns else data['Close'].rolling(50).mean()
+        features['Dist_SMA20'] = (data['Close'] - sma20) / (sma20 + 1e-9)
+        features['Dist_SMA50'] = (data['Close'] - sma50) / (sma50 + 1e-9)
+
+        # Golden/Death cross
+        sma200 = data['SMA200'] if 'SMA200' in data.columns else data['Close'].rolling(200).mean()
+        features['SMA_Cross'] = ((sma50 > sma200).astype(float) -
+                                  (sma50 < sma200).astype(float))
+
+        # ATR normalizado
+        if 'ATR' in data.columns:
+            features['ATR_Norm'] = data['ATR'] / (data['Close'] + 1e-9)
+        elif 'ATR_14' in data.columns:
+            features['ATR_Norm'] = data['ATR_14'] / (data['Close'] + 1e-9)
+        else:
+            hl = data['High'] - data['Low']
+            hc = (data['High'] - data['Close'].shift()).abs()
+            lc = (data['Low'] - data['Close'].shift()).abs()
+            tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+            features['ATR_Norm'] = tr.ewm(alpha=1/14, adjust=False).mean() / (data['Close'] + 1e-9)
+
+        # Volatilidad histórica 20d
+        returns = data['Returns'] if 'Returns' in data.columns else data['Close'].pct_change()
+        features['HV_20'] = returns.rolling(20).std() * np.sqrt(252)
+
+        # RVOL 20
+        if 'RVOL' in data.columns:
+            features['RVOL_20'] = data['RVOL']
+        elif 'RVOL_20' in data.columns:
+            features['RVOL_20'] = data['RVOL_20']
+        else:
+            avg_vol = data['Volume'].rolling(20).mean()
+            features['RVOL_20'] = data['Volume'] / (avg_vol + 1e-9)
+
+        # Retornos multi-escala
+        features['Return_1D'] = data['Close'].pct_change(1)
+        features['Return_5D'] = data['Close'].pct_change(5)
+        features['Return_20D'] = data['Close'].pct_change(20)
+
+        # Posición en rango 20D
+        high_20 = data['High'].rolling(20).max()
+        low_20 = data['Low'].rolling(20).min()
+        features['Position_Range'] = (data['Close'] - low_20) / (high_20 - low_20 + 1e-9)
+
+        # MACD Hist normalizado
+        if 'MACD_Hist' in data.columns:
+            features['MACD_Hist'] = data['MACD_Hist'] / (data['Close'] + 1e-9)
+
+        # ADX normalizado
+        if 'ADX' in data.columns:
+            features['ADX'] = data['ADX'] / 100
+
+        # StochRSI
+        if 'StochRSI' in data.columns:
+            features['StochRSI'] = data['StochRSI']
+
+        # BB Width normalizado
+        if 'BB_Width' in data.columns:
+            features['BB_Width'] = data['BB_Width'] / (data['Close'] + 1e-9)
+        elif 'BB_Upper' in data.columns and 'BB_Lower' in data.columns:
+            features['BB_Width'] = (data['BB_Upper'] - data['BB_Lower']) / (data['Close'] + 1e-9)
+
         return features.dropna()
     
     def build_model(self, input_shape: Tuple) -> Sequential:
@@ -174,27 +206,20 @@ class LSTMTradingModel:
         Returns:
             Modelo compilado
         """
+        # Arquitectura reducida para Railway (menos RAM, menos overfitting)
+        # Original: 128→64→32 (~300K params) → Ahora: 64→32→16 (~50K params)
         model = Sequential([
-            # Primera capa LSTM - memoria de largo plazo
-            LSTM(128, return_sequences=True, input_shape=input_shape),
+            LSTM(64, return_sequences=True, input_shape=input_shape),
             Dropout(0.2),
             BatchNormalization(),
-            
-            # Segunda capa LSTM - refina patrones
-            LSTM(64, return_sequences=True),
-            Dropout(0.2),
-            BatchNormalization(),
-            
-            # Tercera capa LSTM - extrae features finales
+
             LSTM(32, return_sequences=False),
-            Dropout(0.3),
+            Dropout(0.2),
             BatchNormalization(),
-            
-            # Capas densas para clasificación
+
             Dense(16, activation='relu'),
             Dropout(0.2),
-            
-            # Output layer - probabilidad de subida
+
             Dense(1, activation='sigmoid')
         ])
         
@@ -440,20 +465,38 @@ class LSTMTradingModel:
             raise ValueError("Modelo no entrenado")
         
         # Preparar features
-        features_df = self.prepare_features(data)
-        
+        try:
+            features_df = self.prepare_features(data)
+        except Exception as e:
+            raise ValueError(f"Error preparando features: {e}")
+
         if len(features_df) < self.lookback_window:
             raise ValueError(f"Necesitas al menos {self.lookback_window} días de datos")
-        
+
         # Tomar últimos lookback_window días
         recent_data = features_df.iloc[-self.lookback_window:].values
-        
+
+        # Verificar NaN antes de escalar
+        if np.isnan(recent_data).any():
+            # Rellenar NaN con la media de la columna
+            col_means = np.nanmean(recent_data, axis=0)
+            for j in range(recent_data.shape[1]):
+                mask = np.isnan(recent_data[:, j])
+                recent_data[mask, j] = col_means[j]
+
+        # Verificar shape matches scaler
+        if recent_data.shape[1] != self.scaler.n_features_in_:
+            raise ValueError(
+                f"Feature count mismatch: got {recent_data.shape[1]}, "
+                f"expected {self.scaler.n_features_in_}"
+            )
+
         # Normalizar
         recent_scaled = self.scaler.transform(recent_data)
-        
+
         # Reshape para LSTM: (1, lookback_window, n_features)
         X_pred = recent_scaled.reshape(1, self.lookback_window, -1)
-        
+
         # Predecir
         prob_up = self.model.predict(X_pred, verbose=0)[0][0]
         prob_down = 1 - prob_up

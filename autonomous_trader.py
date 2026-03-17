@@ -220,7 +220,7 @@ class AlpacaClient:
                      limit_price: float = None,
                      stop_price: float = None) -> Optional[Dict]:
         """
-        Envía una orden a Alpaca.
+        Envía una orden simple a Alpaca.
         side: 'buy' | 'sell'
         order_type: 'market' | 'limit' | 'stop' | 'stop_limit'
         """
@@ -246,6 +246,42 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"❌ Error enviando orden {side} {symbol}: {e}")
             return None
+
+    def submit_bracket_order(self, symbol: str, qty: float,
+                              stop_loss: float,
+                              take_profit: float) -> Optional[Dict]:
+        """
+        Envía un bracket order (OTO) a Alpaca:
+          - Orden principal: Market BUY
+          - Stop loss: sell stop automático
+          - Take profit: sell limit automático
+
+        Si Railway se cae, Alpaca mantiene las órdenes de protección activas.
+        """
+        data = {
+            "symbol":        symbol,
+            "qty":           str(round(qty, 4)),
+            "side":          "buy",
+            "type":          "market",
+            "time_in_force": "gtc",
+            "order_class":   "bracket",
+            "stop_loss":     {"stop_price": str(round(stop_loss, 2))},
+            "take_profit":   {"limit_price": str(round(take_profit, 2))},
+        }
+
+        try:
+            order = self._post("/v2/orders", data)
+            logger.info(
+                f"📋 Bracket order: BUY {qty:.4f} {symbol} | "
+                f"SL: ${stop_loss:.2f} | TP: ${take_profit:.2f} | "
+                f"ID: {order.get('id','?')[:8]}"
+            )
+            return order
+        except Exception as e:
+            logger.error(f"❌ Error bracket order {symbol}: {e}")
+            # Fallback: orden simple sin protección
+            logger.warning(f"⚠️ Fallback a orden simple para {symbol}")
+            return self.submit_order(symbol, qty, "buy")
 
     def get_orders(self, status: str = "open") -> List[Dict]:
         return self._get(f"/v2/orders?status={status}")
@@ -298,10 +334,61 @@ class TradingBrain:
 
     def __init__(self, alpaca: AlpacaClient):
         self.alpaca        = alpaca
-        self.trade_history: List[Dict] = []  # Log de operaciones del día
+        self.trade_history: List[Dict] = []
         self.daily_pnl     = 0.0
         self.peak_equity   = None
         self.last_trade_time: Dict[str, datetime] = {}
+
+        # Cargar estado persistente (sobrevive restarts de Railway)
+        self._load_state()
+
+    def _state_path(self) -> str:
+        return "data/trader_state.json"
+
+    def _load_state(self):
+        """Carga estado desde disco (sobrevive restarts de Railway)."""
+        try:
+            import json
+            path = self._state_path()
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    state = json.load(f)
+                self.peak_equity = state.get("peak_equity")
+                self.daily_pnl = state.get("daily_pnl", 0.0)
+                # Restaurar trade history del día actual
+                today = datetime.now().strftime("%Y-%m-%d")
+                self.trade_history = [
+                    t for t in state.get("trade_history", [])
+                    if t.get("date") == today
+                ]
+                # Restaurar cooldowns
+                for ticker, ts in state.get("last_trade_time", {}).items():
+                    try:
+                        self.last_trade_time[ticker] = datetime.fromisoformat(ts)
+                    except Exception:
+                        pass
+                logger.info(f"📂 Estado del trader restaurado (peak: ${self.peak_equity or 0:,.2f})")
+        except Exception as e:
+            logger.debug(f"No se pudo cargar estado: {e}")
+
+    def _save_state(self):
+        """Persiste estado crítico a disco."""
+        try:
+            import json
+            Path("data").mkdir(exist_ok=True)
+            state = {
+                "peak_equity": self.peak_equity,
+                "daily_pnl": self.daily_pnl,
+                "trade_history": self.trade_history,
+                "last_trade_time": {
+                    k: v.isoformat() for k, v in self.last_trade_time.items()
+                },
+                "saved_at": datetime.now().isoformat(),
+            }
+            with open(self._state_path(), "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.debug(f"No se pudo guardar estado: {e}")
 
     # ── Decisión de entrada ───────────────────────────────────────────────────
 
@@ -507,7 +594,10 @@ class TradingBrain:
             if self.peak_equity is None:
                 self.peak_equity = equity
             else:
+                old_peak = self.peak_equity
                 self.peak_equity = max(self.peak_equity, equity)
+                if self.peak_equity != old_peak:
+                    self._save_state()  # Persistir nuevo pico
 
             # Drawdown actual
             if self.peak_equity > 0:
@@ -533,7 +623,7 @@ class TradingBrain:
 
     def log_trade(self, ticker: str, action: str, qty: float,
                   price: float, reason: str):
-        """Registra operación en el historial."""
+        """Registra operación en el historial y persiste a disco."""
         self.last_trade_time[ticker] = datetime.now()
         self.trade_history.append({
             "date":   datetime.now().strftime("%Y-%m-%d"),
@@ -544,6 +634,7 @@ class TradingBrain:
             "price":  price,
             "reason": reason,
         })
+        self._save_state()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,8 +792,11 @@ class AutonomousTrader:
                     f"SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}"
                 )
 
-                order = self.alpaca.submit_order(
-                    symbol=ticker, qty=qty, side="buy"
+                # Bracket order: stop loss + take profit como órdenes reales
+                # Si Railway se cae, Alpaca mantiene la protección activa
+                order = self.alpaca.submit_bracket_order(
+                    symbol=ticker, qty=qty,
+                    stop_loss=stop_loss, take_profit=take_profit,
                 )
 
                 if order:
