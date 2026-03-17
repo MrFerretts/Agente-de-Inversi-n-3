@@ -7,10 +7,15 @@ FIX 2026-03-17:
 
 import pandas as pd
 import numpy as np
-import streamlit as st
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 import hashlib
+
+try:
+    import streamlit as st
+    _HAS_STREAMLIT = True
+except ImportError:
+    _HAS_STREAMLIT = False
 
 
 class StateManager:
@@ -18,6 +23,8 @@ class StateManager:
 
     def __init__(self, cache_ttl_seconds: int = 300):
         self.cache_ttl = cache_ttl_seconds
+        if not _HAS_STREAMLIT:
+            return
         if 'cache_store' not in st.session_state:
             st.session_state.cache_store = {}
         if 'analysis_cache' not in st.session_state:
