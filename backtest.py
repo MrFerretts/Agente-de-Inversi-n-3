@@ -46,8 +46,16 @@ from technical_analysis import TechnicalAnalyzer
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TICKERS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
-    "TSLA", "COIN", "OKTA", "USO", "V",
+    # Tech giants
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+    # Semis & cloud
+    "AMD", "AVGO", "CRM", "ADBE", "ORCL", "NFLX",
+    # Fintech / payments
+    "V", "MA", "PYPL",
+    # E-commerce / gig
+    "SHOP", "UBER", "ABNB", "COIN",
+    # Traditional
+    "JPM", "COST", "UNH", "XOM",
 ]
 
 BT_CONFIG = {
@@ -773,15 +781,23 @@ def run_portfolio_momentum(all_data: Dict[str, pd.DataFrame],
                             top_n: int = 5,
                             ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     """
-    Estrategia Híbrida: Buy & Hold con Momentum Rotation + Protección de Crashes.
+    Estrategia: Relative Momentum Rotation.
 
-    Siempre 100% invertido. Cada rebalance_days días, rankea por momentum
-    y concentra en los top_n tickers. NUNCA tiene cash (como Buy & Hold).
-    Supera B&H porque sobrepondera ganadores y sale de perdedores antes.
+    Día 1: Compra TODOS los tickers equal weight (idéntico a Buy & Hold).
+    Cada N días:
+      - Rankea todos los holdings por retorno relativo de 60 días
+      - Vende el peor (bottom 1-2) y añade ese cash al mejor (top 1-2)
+      - NO usa señales absolutas (SMA200, etc.) — solo ranking relativo
+      - Siempre 100% invertido, nunca cash
+
+    Por qué funciona:
+      - Misma exposición total que B&H (siempre 100% invertido)
+      - Pero concentra capital en los que MÁS suben
+      - Reduce exposición a los que MENOS suben (no a los que bajan)
+      - Cero timing del mercado — solo selección relativa
     """
     analyzer = TechnicalAnalyzer({})
 
-    # Preparar indicadores para todos los tickers
     processed = {}
     for ticker, df in all_data.items():
         try:
@@ -793,140 +809,109 @@ def run_portfolio_momentum(all_data: Dict[str, pd.DataFrame],
             continue
 
     if len(processed) < 3:
-        logger.warning("Datos insuficientes para momentum rotation")
+        logger.warning("Datos insuficientes para momentum")
         return pd.DataFrame(), pd.DataFrame(), {}
 
-    # Alinear fechas comunes
     common_dates = None
     for pdf in processed.values():
         dates = set(pdf.index)
         common_dates = dates if common_dates is None else common_dates & dates
-
     common_dates = sorted(common_dates)
     if len(common_dates) < 100:
-        logger.warning("Fechas comunes insuficientes")
         return pd.DataFrame(), pd.DataFrame(), {}
 
-    # Simulación — SIEMPRE 100% invertido, solo rotación pura
     capital = 0.0
-    holdings = {}  # {ticker: {"qty": float, "entry": float, "date": date}}
+    holdings = {}
     equity_curve = []
     trades = []
     slippage_comm = BT_CONFIG["slippage_pct"] + BT_CONFIG["commission_pct"]
-    tickers_list = list(processed.keys())
 
-    # Día 1: invertir en top_n tickers por momentum (o todos si < top_n)
-    first_date = common_dates[60]
-    actual_top = min(top_n, len(tickers_list))
-    per_ticker = initial_capital / actual_top
+    # Día 1: comprar TODOS los tickers equal weight
+    first_date = common_dates[0]
+    n_tickers = len(processed)
+    per_ticker_capital = initial_capital / n_tickers
     remaining = initial_capital
 
-    # Primer ranking
-    first_ranked = []
-    for ticker in tickers_list:
-        loc = processed[ticker].index.get_loc(first_date)
-        if loc < 20:
-            first_ranked.append((ticker, 0))
-            continue
-        p = float(processed[ticker].loc[first_date, "Close"])
-        p20 = float(processed[ticker].iloc[loc-20]["Close"])
-        first_ranked.append((ticker, (p/p20 - 1) * 100))
-    first_ranked.sort(key=lambda x: x[1], reverse=True)
-    initial_tickers = [t for t, _ in first_ranked[:actual_top]]
-
-    for ticker in initial_tickers:
+    for ticker in processed.keys():
         price = float(processed[ticker].loc[first_date, "Close"])
         buy_price = price * (1 + slippage_comm)
-        qty = per_ticker / buy_price
+        qty = per_ticker_capital / buy_price
         remaining -= qty * buy_price
         holdings[ticker] = {"qty": qty, "entry": buy_price, "date": first_date}
     capital = remaining
 
     for day_idx, date in enumerate(common_dates):
-        if date < first_date:
-            equity_curve.append({"date": date, "equity": initial_capital})
-            continue
-
-        # Valor actual del portafolio
+        # Valor del portafolio
         portfolio_value = capital
         for ticker, h in holdings.items():
             if date in processed[ticker].index:
                 portfolio_value += h["qty"] * float(processed[ticker].loc[date, "Close"])
-
         equity_curve.append({"date": date, "equity": portfolio_value})
 
-        # ── Rebalanceo: rotar hacia los más fuertes ──────────────────
-        if day_idx % rebalance_days != 0 or day_idx < 61:
+        # Rebalancear cada N días después del warm-up
+        if day_idx < 60 or day_idx % rebalance_days != 0:
+            continue
+        if len(holdings) < 3:
             continue
 
-        # Calcular momentum score
-        momentum_scores = {}
-        for ticker, pdf in processed.items():
-            if date not in pdf.index:
+        # Rankear holdings por retorno relativo de 60 días
+        perf = []
+        for ticker, h in holdings.items():
+            if date not in processed[ticker].index:
                 continue
-            row = pdf.loc[date]
-            price = float(row["Close"])
-            loc = pdf.index.get_loc(date)
+            loc = processed[ticker].index.get_loc(date)
             if loc < 60:
                 continue
-            ret_20d = (price / float(pdf.iloc[loc - 20]["Close"]) - 1) * 100
-            ret_60d = (price / float(pdf.iloc[loc - 60]["Close"]) - 1) * 100
-            sma50 = row.get("SMA50", price)
-            sma200 = row.get("SMA200", price)
+            price = float(processed[ticker].loc[date, "Close"])
+            price_60d = float(processed[ticker].iloc[loc - 60]["Close"])
+            ret_60d = (price / price_60d - 1)
+            value = h["qty"] * price
+            perf.append((ticker, ret_60d, value, price))
 
-            score = ret_20d * 1.5 + ret_60d * 1.0
-            if pd.notna(sma50) and price > sma50:
-                score += 10
-            if pd.notna(sma200) and price > sma200:
-                score += 10
-            momentum_scores[ticker] = score
-
-        if not momentum_scores:
+        if len(perf) < 3:
             continue
 
-        # Top N tickers
-        ranked = sorted(momentum_scores.items(), key=lambda x: x[1], reverse=True)
-        target_tickers = [t for t, _ in ranked[:actual_top]]
+        perf.sort(key=lambda x: x[1])  # Peor primero
 
-        # ¿Cambió el top? Solo rotar si hay cambios
-        current_tickers = set(holdings.keys())
-        target_set = set(target_tickers)
-        if current_tickers == target_set:
-            continue  # Sin cambios = sin trades = sin comisiones
+        # Cuántos rotar: 1 de bottom, redistribuir al top
+        # Solo rotar si hay diferencia significativa (>15% spread entre top y bottom)
+        worst = perf[0]
+        best = perf[-1]
+        spread = best[1] - worst[1]
 
-        # Vender los que ya no están en el top
-        for ticker in list(holdings.keys()):
-            if ticker not in target_set:
-                h = holdings[ticker]
-                if date in processed[ticker].index:
-                    price = float(processed[ticker].loc[date, "Close"])
-                    sell_price = price * (1 - slippage_comm)
-                    pnl = (sell_price - h["entry"]) * h["qty"]
-                    capital += h["qty"] * sell_price
-                    trades.append({
-                        "ticker": ticker, "entry_date": h["date"],
-                        "exit_date": date, "entry": h["entry"],
-                        "exit": sell_price, "qty": h["qty"],
-                        "pnl": pnl, "reason": "rotation_out",
-                        "pnl_pct": (sell_price / h["entry"] - 1) * 100,
-                    })
-                    del holdings[ticker]
+        if spread < 0.15:  # No rotar si todos van similar (<15% spread)
+            continue
 
-        # Comprar los nuevos con el cash liberado (equal weight)
-        new_tickers = [t for t in target_tickers if t not in holdings]
-        if new_tickers and capital > 100:
-            per_new = capital / len(new_tickers)
-            for ticker in new_tickers:
-                if date in processed[ticker].index:
-                    price = float(processed[ticker].loc[date, "Close"])
-                    buy_price = price * (1 + slippage_comm)
-                    qty = (per_new * 0.98) / buy_price
-                    capital -= qty * buy_price
-                    holdings[ticker] = {"qty": qty, "entry": buy_price, "date": date}
+        # Vender el peor
+        worst_ticker = worst[0]
+        h = holdings[worst_ticker]
+        price = worst[3]
+        sell_price = price * (1 - slippage_comm)
+        pnl = (sell_price - h["entry"]) * h["qty"]
+        freed_cash = h["qty"] * sell_price
+        capital += freed_cash
+        trades.append({
+            "ticker": worst_ticker, "entry_date": h["date"],
+            "exit_date": date, "entry": h["entry"],
+            "exit": sell_price, "qty": h["qty"],
+            "pnl": pnl, "reason": "worst_rotation",
+            "pnl_pct": (sell_price / h["entry"] - 1) * 100,
+        })
+        del holdings[worst_ticker]
 
-    # Cerrar todo al final
+        # Añadir el cash al top 3 holdings (equal split)
+        top_3 = perf[-3:]
+        per_add = freed_cash / len(top_3)
+        for ticker, _, _, price in top_3:
+            if ticker in holdings and per_add > 10:
+                buy_price = price * (1 + slippage_comm)
+                qty = (per_add * 0.98) / buy_price
+                capital -= qty * buy_price
+                holdings[ticker]["qty"] += qty
+
+    # Cerrar al final
     last_date = common_dates[-1]
-    for ticker, h in holdings.items():
+    for ticker, h in list(holdings.items()):
         if last_date in processed[ticker].index:
             price = float(processed[ticker].loc[last_date, "Close"])
             sell_price = price * (1 - slippage_comm)
@@ -943,7 +928,6 @@ def run_portfolio_momentum(all_data: Dict[str, pd.DataFrame],
     equity_df = pd.DataFrame(equity_curve).set_index("date")
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
     metrics = compute_metrics(equity_df, trades_df, initial_capital)
-
     return equity_df, trades_df, metrics
 
 
@@ -1118,11 +1102,11 @@ def run_backtest(tickers: List[str], years: int = 5,
     logger.info("=" * 60)
 
     # Momentum Rotation
-    logger.info("  [1/2] Smart Buy & Hold (protección de crash + momentum)...")
+    logger.info("  [1/2] Relative Momentum Rotation...")
     try:
         eq_mom, tr_mom, m_mom = run_portfolio_momentum(
             data, BT_CONFIG["initial_capital"],
-            rebalance_days=20, top_n=len(data),
+            rebalance_days=20, top_n=min(5, len(data)),
         )
         if m_mom:
             logger.info(
