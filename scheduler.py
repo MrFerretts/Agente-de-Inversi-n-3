@@ -116,6 +116,12 @@ class Database:
     def get_ticker_history(self, ticker: str, days: int = 7) -> pd.DataFrame:
         return db_supabase.get_ticker_history(ticker, days)
 
+    def save_trade(self, ticker, action, qty, price, pnl_pct=None,
+                   stop_loss=None, take_profit=None, reason=None,
+                   order_id=None, status='filled'):
+        db_supabase.save_trade(ticker, action, qty, price, pnl_pct,
+                               stop_loss, take_profit, reason, order_id, status)
+
     def save_ml_signal(self, ticker: str, prediction: Dict):
         pass
 

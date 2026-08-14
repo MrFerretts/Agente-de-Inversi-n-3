@@ -112,8 +112,24 @@ def init_tables():
             reason      TEXT,
             score       NUMERIC(8,2)
         )""",
+        """CREATE TABLE IF NOT EXISTS trades (
+            id           SERIAL PRIMARY KEY,
+            ticker       VARCHAR(20)  NOT NULL,
+            action       VARCHAR(10)  NOT NULL,
+            qty          NUMERIC(18,6) NOT NULL,
+            price        NUMERIC(18,4) NOT NULL,
+            value_usd    NUMERIC(18,4) GENERATED ALWAYS AS (qty * price) STORED,
+            pnl_pct      NUMERIC(10,4),
+            stop_loss    NUMERIC(18,4),
+            take_profit  NUMERIC(18,4),
+            reason       TEXT,
+            order_id     VARCHAR(64),
+            status       VARCHAR(20)  NOT NULL DEFAULT 'filled',
+            timestamp    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_scan_ticker_ts ON scan_results (ticker, timestamp DESC)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts_sent (timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_trades_ticker_ts ON trades (ticker, timestamp DESC)",
     ]
     for sql in ddl:
         try:
@@ -268,6 +284,72 @@ def alert_cooldown_ok(ticker: str, alert_type: str, minutes: int = 30) -> bool:
     if df.empty:
         return True
     return int(df["cnt"].iloc[0]) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_trade(ticker: str, action: str, qty: float, price: float,
+               pnl_pct: float = None, stop_loss: float = None,
+               take_profit: float = None, reason: str = None,
+               order_id: str = None, status: str = 'filled'):
+    execute("""
+        INSERT INTO trades (ticker, action, qty, price, pnl_pct,
+                            stop_loss, take_profit, reason, order_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (ticker, action.upper(), qty, price, pnl_pct,
+          stop_loss, take_profit, reason, order_id, status))
+
+
+def get_trades(ticker: str = None, days: int = 30) -> pd.DataFrame:
+    if ticker:
+        return query_df("""
+            SELECT id, ticker, action, qty, price, value_usd, pnl_pct,
+                   stop_loss, take_profit, reason, order_id, status, timestamp
+            FROM trades
+            WHERE ticker = :ticker
+              AND timestamp >= NOW() - INTERVAL :interval
+            ORDER BY timestamp DESC
+        """, {"ticker": ticker, "interval": f"{days} days"})
+    return query_df("""
+        SELECT id, ticker, action, qty, price, value_usd, pnl_pct,
+               stop_loss, take_profit, reason, order_id, status, timestamp
+        FROM trades
+        WHERE timestamp >= NOW() - INTERVAL :interval
+        ORDER BY timestamp DESC
+    """, {"interval": f"{days} days"})
+
+
+def get_trades_summary(days: int = 30) -> Dict:
+    df = query_df("""
+        SELECT
+            COUNT(*)                                          AS total_trades,
+            COUNT(*) FILTER (WHERE action = 'SELL')           AS closed_trades,
+            COUNT(*) FILTER (WHERE action = 'SELL' AND pnl_pct > 0) AS wins,
+            COUNT(*) FILTER (WHERE action = 'SELL' AND pnl_pct <= 0) AS losses,
+            COALESCE(SUM(pnl_pct) FILTER (WHERE action = 'SELL' AND pnl_pct > 0), 0) AS gross_profit,
+            COALESCE(ABS(SUM(pnl_pct) FILTER (WHERE action = 'SELL' AND pnl_pct < 0)), 0) AS gross_loss,
+            COALESCE(AVG(pnl_pct) FILTER (WHERE action = 'SELL'), 0) AS avg_pnl_pct
+        FROM trades
+        WHERE timestamp >= NOW() - INTERVAL :interval
+    """, {"interval": f"{days} days"})
+    if df.empty:
+        return {"total_trades": 0, "win_rate": 0, "profit_factor": 0}
+    row = df.iloc[0]
+    closed = int(row["closed_trades"])
+    wins   = int(row["wins"])
+    gross_profit = float(row["gross_profit"])
+    gross_loss   = float(row["gross_loss"])
+    return {
+        "total_trades":  int(row["total_trades"]),
+        "closed_trades": closed,
+        "wins":          wins,
+        "losses":        int(row["losses"]),
+        "win_rate":      round(wins / closed * 100, 1) if closed > 0 else 0,
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0,
+        "avg_pnl_pct":   round(float(row["avg_pnl_pct"]), 2),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -895,19 +895,14 @@ class AutonomousTrader:
     def _save_trade_db(self, ticker: str, action: str, qty: float,
                         price: float, pnl_pct: float, reason: str,
                         stop_loss: float = None, take_profit: float = None):
-        """Guarda la operación en Supabase."""
+        """Guarda la operación en la tabla trades de Supabase."""
         try:
-            import json
-            message = json.dumps({
-                "action":      action,
-                "qty":         qty,
-                "price":       price,
-                "pnl_pct":     pnl_pct,
-                "stop_loss":   stop_loss,
-                "take_profit": take_profit,
-                "reason":      reason,
-            })
-            self.db.save_alert(ticker, f"trade_{action.lower()}", message, "alpaca")
+            self.db.save_trade(
+                ticker=ticker, action=action.upper(), qty=qty,
+                price=price, pnl_pct=pnl_pct,
+                stop_loss=stop_loss, take_profit=take_profit,
+                reason=reason,
+            )
         except Exception as e:
             logger.warning(f"⚠️ No se pudo guardar trade en BD: {e}")
 
